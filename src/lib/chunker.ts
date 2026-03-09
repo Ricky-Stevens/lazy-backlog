@@ -232,10 +232,10 @@ export function chunkMarkdown(markdown: string, options?: ChunkOptions): Chunk[]
 export function stripBoilerplate(md: string): string {
   return (
     md
-      // Page properties macro remnants
-      .replaceAll(/\|?\s*Created by[^|\n]*\d{4}\s*\|?/gi, "")
+      // Page properties macro remnants (bounded to single line, no backtracking)
+      .replaceAll(/\|?[ \t]*Created by[^|\n]*\d{4}[ \t]*\|?/gi, "")
       // "Last updated" lines
-      .replaceAll(/Last (updated|modified|edited).*?\n/gi, "")
+      .replaceAll(/Last (updated|modified|edited)[^\n]*\n/gi, "")
       // Empty table rows
       .replaceAll(/\|\s*\|\s*\|\s*\n/g, "")
       // Confluence status macros
