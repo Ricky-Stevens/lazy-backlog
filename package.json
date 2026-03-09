@@ -4,9 +4,16 @@
   "description": "AI-powered Jira ticket generation grounded in Confluence knowledge. Let AI do your backlog refinement.",
   "module": "src/index.ts",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ricky-Stevens/lazy-backlog.git"
+  },
+  "keywords": ["mcp", "jira", "confluence", "atlassian", "ai", "backlog", "tickets"],
   "bin": {
     "lazy-backlog": "src/index.ts"
   },
+  "files": ["src", "package.json", "README.md", "LICENSE"],
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",

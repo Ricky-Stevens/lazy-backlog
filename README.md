@@ -33,24 +33,49 @@ AI-powered MCP server that spiders Confluence for project context and generates 
 | `list-spaces` | List accessible Confluence spaces |
 | `rebuild-index` | Rebuild FTS5 search index |
 
-## Setup
+## Quick Install
 
-### Prerequisites
+Requires [Bun](https://bun.sh) and an [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens).
 
-- [Bun](https://bun.sh) runtime
-- Atlassian Cloud account with API token
-
-### 1. Install
+### Claude Code
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/lazy-backlog.git
+claude mcp add lazy-backlog \
+  -e ATLASSIAN_SITE_URL=https://yoursite.atlassian.net \
+  -e ATLASSIAN_EMAIL=you@example.com \
+  -e ATLASSIAN_API_TOKEN=your-token \
+  -- bunx lazy-backlog
+```
+
+### Cursor / Windsurf / other MCP clients
+
+Add to your `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "lazy-backlog": {
+      "command": "bunx",
+      "args": ["lazy-backlog"],
+      "env": {
+        "ATLASSIAN_SITE_URL": "https://yoursite.atlassian.net",
+        "ATLASSIAN_EMAIL": "you@example.com",
+        "ATLASSIAN_API_TOKEN": "your-api-token"
+      }
+    }
+  }
+}
+```
+
+### From source
+
+```bash
+git clone https://github.com/Ricky-Stevens/lazy-backlog.git
 cd lazy-backlog
 bun install
 ```
 
-### 2. Configure your MCP client
-
-Add to your `.mcp.json` (Claude Code, Cursor, etc.):
+Then point your MCP client at the local path:
 
 ```json
 {
@@ -68,18 +93,16 @@ Add to your `.mcp.json` (Claude Code, Cursor, etc.):
 }
 ```
 
-### 3. Initialize
+## Getting Started
 
-In your AI client, run:
+Once installed, run in your AI client:
 
 ```
 configure with jiraProjectKey="PROJ", jiraBoardId="123", confluenceSpaces=["Engineering"]
 setup
 ```
 
-This discovers your Jira schema and indexes Confluence in one step.
-
-### 4. Create tickets
+Then create tickets:
 
 ```
 plan-tickets with description="Add OAuth2 support for API authentication"
