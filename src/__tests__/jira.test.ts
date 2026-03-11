@@ -11,7 +11,7 @@ type AnyAdfNode = {
   text?: string;
   content?: AnyAdfNode[];
   attrs?: Record<string, unknown>;
-  marks?: { type: string }[];
+  marks?: { type: string; attrs?: Record<string, string> }[];
 };
 
 // Helper to extract fetch call body
@@ -154,6 +154,39 @@ describe("markdownToAdf", () => {
     expect(adf.content?.[0]?.content).toHaveLength(3);
   });
 
+  it("nests bullet sub-items under parent item", () => {
+    const adf = toAdf("- Parent\n  - Child one\n  - Child two\n- Second parent");
+    expect(adf.content).toHaveLength(1);
+    const list = adf.content?.[0];
+    expect(list?.type).toBe("bulletList");
+    expect(list?.content).toHaveLength(2);
+    // First item has a nested bulletList
+    const firstItem = list?.content?.[0];
+    expect(firstItem?.content).toHaveLength(2); // paragraph + nested list
+    const nestedList = firstItem?.content?.[1];
+    expect(nestedList?.type).toBe("bulletList");
+    expect(nestedList?.content).toHaveLength(2);
+  });
+
+  it("nests ordered sub-items under bullet parent", () => {
+    const adf = toAdf("- Parent\n  1. Step one\n  2. Step two");
+    const firstItem = adf.content?.[0]?.content?.[0];
+    const nestedList = firstItem?.content?.[1];
+    expect(nestedList?.type).toBe("orderedList");
+    expect(nestedList?.content).toHaveLength(2);
+  });
+
+  it("handles deeply nested lists", () => {
+    const adf = toAdf("- L1\n  - L2\n    - L3");
+    const l1Item = adf.content?.[0]?.content?.[0];
+    const l2List = l1Item?.content?.[1];
+    expect(l2List?.type).toBe("bulletList");
+    const l2Item = l2List?.content?.[0];
+    const l3List = l2Item?.content?.[1];
+    expect(l3List?.type).toBe("bulletList");
+    expect(l3List?.content).toHaveLength(1);
+  });
+
   it("converts code blocks with language", () => {
     const adf = toAdf("```typescript\nconst x = 1;\n```");
     expect(adf.content?.[0]?.type).toBe("codeBlock");
@@ -192,6 +225,59 @@ describe("markdownToAdf", () => {
     const codeNode = para?.content?.find((n) => n.marks?.some((m) => m.type === "code"));
     expect(codeNode).toBeDefined();
     expect(codeNode?.text).toBe("bun test");
+  });
+
+  it("converts markdown links to ADF link marks", () => {
+    const adf = toAdf("See [Confluence](https://example.com/wiki) for details");
+    const para = adf.content?.[0];
+    const linkNode = para?.content?.find((n) => n.marks?.some((m) => m.type === "link"));
+    expect(linkNode).toBeDefined();
+    expect(linkNode?.text).toBe("Confluence");
+    expect(linkNode?.marks?.[0]?.attrs?.href).toBe("https://example.com/wiki");
+  });
+
+  it("converts bare URLs to ADF link marks", () => {
+    const adf = toAdf("Visit https://example.com/page for more info");
+    const para = adf.content?.[0];
+    const linkNode = para?.content?.find((n) => n.marks?.some((m) => m.type === "link"));
+    expect(linkNode).toBeDefined();
+    expect(linkNode?.text).toBe("https://example.com/page");
+    expect(linkNode?.marks?.[0]?.attrs?.href).toBe("https://example.com/page");
+  });
+
+  it("handles multiple links in one line", () => {
+    const adf = toAdf("[A](https://a.com) and [B](https://b.com)");
+    const para = adf.content?.[0];
+    const linkNodes = para?.content?.filter((n) => n.marks?.some((m) => m.type === "link"));
+    expect(linkNodes).toHaveLength(2);
+    expect(linkNodes?.[0]?.text).toBe("A");
+    expect(linkNodes?.[1]?.text).toBe("B");
+  });
+
+  it("converts task list items to taskList/taskItem nodes", () => {
+    const adf = toAdf("- [ ] Todo item\n- [x] Done item");
+    expect(adf.content).toHaveLength(1);
+    const taskList = adf.content?.[0];
+    expect(taskList?.type).toBe("taskList");
+    expect(taskList?.content).toHaveLength(2);
+    expect(taskList?.content?.[0]?.type).toBe("taskItem");
+    expect(taskList?.content?.[0]?.attrs?.state).toBe("TODO");
+    expect(taskList?.content?.[0]?.content?.[0]?.text).toBe("Todo item");
+    expect(taskList?.content?.[1]?.attrs?.state).toBe("DONE");
+    expect(taskList?.content?.[1]?.content?.[0]?.text).toBe("Done item");
+  });
+
+  it("handles uppercase X in task list", () => {
+    const adf = toAdf("- [X] Also done");
+    const taskItem = adf.content?.[0]?.content?.[0];
+    expect(taskItem?.attrs?.state).toBe("DONE");
+  });
+
+  it("keeps task lists separate from bullet lists", () => {
+    const adf = toAdf("- [ ] Task\n- Regular bullet");
+    expect(adf.content).toHaveLength(2);
+    expect(adf.content?.[0]?.type).toBe("taskList");
+    expect(adf.content?.[1]?.type).toBe("bulletList");
   });
 
   it("skips empty lines", () => {

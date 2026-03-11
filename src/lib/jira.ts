@@ -86,15 +86,17 @@ type AdfNode =
   | { type: "doc"; version: 1; content: AdfNode[] }
   | { type: "paragraph"; content: AdfNode[] }
   | { type: "heading"; attrs: { level: number }; content: AdfNode[] }
-  | { type: "text"; text: string; marks?: { type: string }[] }
+  | { type: "text"; text: string; marks?: { type: string; attrs?: Record<string, string> }[] }
   | { type: "bulletList"; content: AdfNode[] }
   | { type: "orderedList"; content: AdfNode[] }
   | { type: "listItem"; content: AdfNode[] }
+  | { type: "taskList"; attrs: { localId: string }; content: AdfNode[] }
+  | { type: "taskItem"; attrs: { localId: string; state: "TODO" | "DONE" }; content: AdfNode[] }
   | { type: "codeBlock"; attrs?: { language?: string }; content: AdfNode[] }
   | { type: "rule" }
   | { type: "hardBreak" };
 
-function textNode(text: string, marks?: { type: string }[]): AdfNode {
+function textNode(text: string, marks?: { type: string; attrs?: Record<string, string> }[]): AdfNode {
   return marks?.length ? { type: "text", text, marks } : { type: "text", text };
 }
 
@@ -102,18 +104,21 @@ function paragraph(text: string): AdfNode {
   return { type: "paragraph", content: parseInline(text) };
 }
 
-/** Parse inline markdown (bold, italic, code) into ADF text nodes. */
+/** Parse inline markdown (bold, italic, code, links) into ADF text nodes. */
 function parseInline(text: string): AdfNode[] {
   const nodes: AdfNode[] = [];
-  const re = /(\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)/g;
+  // Markdown links, bold, italic, inline code, or bare URLs
+  const re = /(\[([^\]]+)]\(([^)]+)\)|\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`|(?<![(\[])(https?:\/\/[^\s)>\]]+))/g;
   let last = 0;
   let match: RegExpExecArray | null = re.exec(text);
 
   while (match !== null) {
     if (match.index > last) nodes.push(textNode(text.slice(last, match.index)));
-    if (match[2]) nodes.push(textNode(match[2], [{ type: "strong" }]));
-    else if (match[3]) nodes.push(textNode(match[3], [{ type: "em" }]));
-    else if (match[4]) nodes.push(textNode(match[4], [{ type: "code" }]));
+    if (match[2] && match[3]) nodes.push(textNode(match[2], [{ type: "link", attrs: { href: match[3] } }]));
+    else if (match[4]) nodes.push(textNode(match[4], [{ type: "strong" }]));
+    else if (match[5]) nodes.push(textNode(match[5], [{ type: "em" }]));
+    else if (match[6]) nodes.push(textNode(match[6], [{ type: "code" }]));
+    else if (match[7]) nodes.push(textNode(match[7], [{ type: "link", attrs: { href: match[7] } }]));
     last = match.index + match[0].length;
     match = re.exec(text);
   }
@@ -149,18 +154,78 @@ function parseCodeBlock(lines: string[], i: number): { node: AdfNode; next: numb
   return { node, next: i };
 }
 
-/** Collect consecutive list items matching `pattern` and return a list node. */
-function parseList(
-  lines: string[],
-  i: number,
-  pattern: RegExp,
-  listType: "bulletList" | "orderedList",
-): { node: AdfNode; next: number } {
+let taskIdCounter = 0;
+function nextTaskId(): string {
+  return `task-${++taskIdCounter}`;
+}
+
+const taskItemRe = /^[-*]\s\[([ xX])]\s/;
+
+/** Collect consecutive task list items and return a taskList node. */
+function parseTaskList(lines: string[], i: number): { node: AdfNode; next: number } {
   const items: AdfNode[] = [];
-  while (i < lines.length && pattern.test(lines[i] ?? "")) {
-    items.push({ type: "listItem", content: [paragraph((lines[i] ?? "").replace(pattern, ""))] });
+  while (i < lines.length && taskItemRe.test(lines[i] ?? "")) {
+    const line = lines[i] ?? "";
+    const m = taskItemRe.exec(line);
+    const state = m?.[1] === " " ? "TODO" : "DONE";
+    const text = line.replace(taskItemRe, "");
+    items.push({ type: "taskItem", attrs: { localId: nextTaskId(), state }, content: parseInline(text) });
     i++;
   }
+  const listId = nextTaskId();
+  return { node: { type: "taskList", attrs: { localId: listId }, content: items }, next: i };
+}
+
+/** Detect indent level (number of leading spaces) of a line. */
+function indentLevel(line: string): number {
+  const m = /^( *)/.exec(line);
+  return m?.[1]?.length ?? 0;
+}
+
+/** Check if a line (after stripping indent) is a bullet or ordered list item. Returns the type and stripped text, or null. */
+function detectListItem(line: string): { listType: "bulletList" | "orderedList"; text: string } | null {
+  const stripped = line.trimStart();
+  const bullet = /^[-*]\s(.*)/.exec(stripped);
+  if (bullet) return { listType: "bulletList", text: bullet[1] ?? "" };
+  const ordered = /^\d+\.\s(.*)/.exec(stripped);
+  if (ordered) return { listType: "orderedList", text: ordered[1] ?? "" };
+  return null;
+}
+
+/** Recursively collect list items at the given indent level, nesting deeper items. */
+function parseList(lines: string[], i: number, baseIndent: number): { node: AdfNode; next: number } {
+  const firstItem = detectListItem(lines[i] ?? "");
+  const listType = firstItem?.listType ?? "bulletList";
+  const items: AdfNode[] = [];
+
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    const indent = indentLevel(line);
+
+    // Stop if we've dedented past our level or hit a non-list / blank line at our level
+    if (indent < baseIndent) break;
+    if (indent === baseIndent) {
+      const item = detectListItem(line);
+      if (!item) break;
+
+      const itemContent: AdfNode[] = [paragraph(item.text)];
+
+      // Check if next line is indented deeper — that's a nested list
+      i++;
+      if (i < lines.length && detectListItem(lines[i] ?? "") && indentLevel(lines[i] ?? "") > baseIndent) {
+        const nested = parseList(lines, i, indentLevel(lines[i] ?? ""));
+        itemContent.push(nested.node);
+        i = nested.next;
+      }
+
+      items.push({ type: "listItem", content: itemContent });
+      continue;
+    }
+
+    // Line is indented deeper than base but we're not inside an item — shouldn't happen, skip
+    i++;
+  }
+
   return { node: { type: listType, content: items }, next: i };
 }
 
@@ -196,17 +261,17 @@ export function markdownToAdf(md: string): AdfNode {
       continue;
     }
 
-    // Bullet list
-    if (/^[-*]\s/.test(line)) {
-      const result = parseList(lines, i, /^[-*]\s/, "bulletList");
+    // Task list (must check before bullet list since `- [ ]` also matches `[-*]\s`)
+    if (taskItemRe.test(line)) {
+      const result = parseTaskList(lines, i);
       content.push(result.node);
       i = result.next;
       continue;
     }
 
-    // Ordered list
-    if (/^\d+\.\s/.test(line)) {
-      const result = parseList(lines, i, /^\d+\.\s/, "orderedList");
+    // Bullet or ordered list
+    if (detectListItem(line)) {
+      const result = parseList(lines, i, 0);
       content.push(result.node);
       i = result.next;
       continue;
