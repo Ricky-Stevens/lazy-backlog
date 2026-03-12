@@ -21,7 +21,7 @@ export async function handleCreateAction(
     parent?: string;
     parentKey?: string;
     components?: string[];
-    namedFields?: Record<string, string>;
+    namedFields?: Record<string, string | null>;
     confirmed?: boolean;
     spaceKey?: string;
   },
@@ -134,7 +134,7 @@ export async function handleBulkCreateAction(
       priority: string;
       parentKey?: string;
       components: string[];
-      namedFields?: Record<string, string>;
+      namedFields?: Record<string, string | null>;
     }>;
     confirmed?: boolean;
     spaceKey?: string;

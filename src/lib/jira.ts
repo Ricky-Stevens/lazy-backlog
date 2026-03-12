@@ -311,12 +311,16 @@ export class JiraClient {
 
   private resolveNamedFields(
     fields: Record<string, unknown>,
-    namedFields: Record<string, string>,
+    namedFields: Record<string, string | null>,
     issueType: string,
   ): void {
     for (const [fieldName, valueName] of Object.entries(namedFields)) {
       const fs = this.findFieldSchema(fieldName, issueType);
       if (!fs) continue;
+      if (valueName === null) {
+        fields[fs.id] = null;
+        continue;
+      }
       if (fs.allowedValues?.length) {
         const match = fs.allowedValues.find((v) => v.name.toLowerCase().includes(valueName.toLowerCase()));
         if (match) fields[fs.id] = { id: match.id };

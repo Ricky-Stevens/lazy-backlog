@@ -15,7 +15,7 @@ export interface JiraTicketInput {
   parentKey?: string;
   components?: string[];
   /** Custom fields by display name → value name, resolved to IDs via schema. */
-  namedFields?: Record<string, string>;
+  namedFields?: Record<string, string | null>;
 }
 
 /** Input for updating an existing Jira issue. Only provided fields are changed. */
@@ -27,7 +27,7 @@ export interface JiraTicketUpdate {
   labels?: string[];
   storyPoints?: number;
   components?: string[];
-  namedFields?: Record<string, string>;
+  namedFields?: Record<string, string | null>;
   comment?: string;
   parentKey?: string;
 }
@@ -262,7 +262,7 @@ export interface RawIssueResponse {
 export interface FieldResolvable {
   storyPoints?: number;
   components?: string[];
-  namedFields?: Record<string, string>;
+  namedFields?: Record<string, string | null>;
 }
 
 export interface SprintListResponse {

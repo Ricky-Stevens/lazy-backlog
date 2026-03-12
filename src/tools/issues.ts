@@ -54,9 +54,9 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
           .describe("[create, bulk-create] Parent epic key, e.g. 'BP-10'. Alias for 'parent'"),
         components: z.array(z.string()).optional().describe("[create, update] Component names"),
         namedFields: z
-          .record(z.string(), z.string())
+          .record(z.string(), z.union([z.string(), z.null()]))
           .optional()
-          .describe("[create, update] Custom fields as {'Field Name': 'Value Name'}"),
+          .describe("[create, update] Custom fields as {'Field Name': 'Value Name'}. Pass null to clear a field."),
         comment: z.string().optional().describe("[update] Add a comment to the issue"),
         // bulk-create
         tickets: z.preprocess(

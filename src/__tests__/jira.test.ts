@@ -584,6 +584,20 @@ describe("JiraClient", () => {
       const body = getCallBody(0);
       expect(body.fields).toHaveProperty("customfield_999", { id: "env-2" });
     });
+
+    it("sets field to null when value is null", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchResponse({ id: "10001", key: "BP-201", self: "" });
+
+      await client.createIssue({
+        summary: "Null field test",
+        issueType: "Task",
+        namedFields: { Environment: null },
+      });
+
+      const body = getCallBody(0);
+      expect(body.fields).toHaveProperty("customfield_999", null);
+    });
   });
 
   describe("schema DB operations", () => {
