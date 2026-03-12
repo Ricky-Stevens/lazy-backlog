@@ -274,5 +274,6 @@ function toIndexedPage(page: ConfluencePage, spaceKey: string): IndexedPage {
     created_at: page.createdAt || null,
     updated_at: page.updatedAt || null,
     indexed_at: new Date().toISOString(),
+    source: "confluence",
   };
 }

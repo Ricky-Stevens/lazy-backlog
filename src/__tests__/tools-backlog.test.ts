@@ -432,5 +432,280 @@ describe("registerBacklogTool", () => {
 
       backlogSpy.mockRestore();
     });
+
+    it("handles empty backlog for bottom position ranking", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const backlogSpy = vi.spyOn(JiraClient.prototype, "getBacklogIssues").mockResolvedValueOnce({
+        issues: [] as never[],
+        total: 0,
+      });
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", issueKey: "BP-1", position: "bottom" });
+      const text = getText(result);
+      expect(text).toContain("already at the bottom");
+
+      backlogSpy.mockRestore();
+    });
+
+    it("returns already-at-bottom when issue is last in backlog", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const backlogSpy = vi
+        .spyOn(JiraClient.prototype, "getBacklogIssues")
+        .mockResolvedValueOnce({
+          issues: [] as never[],
+          total: 5,
+        })
+        .mockResolvedValueOnce({
+          issues: [{ key: "BP-1", id: "10001", fields: { summary: "Already bottom" } }] as never[],
+          total: 5,
+        });
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", issueKey: "BP-1", position: "bottom" });
+      const text = getText(result);
+      expect(text).toContain("already at the bottom");
+
+      backlogSpy.mockRestore();
+    });
+
+    it("ranks issue after another with rankAfter", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const rankSpy = vi.spyOn(JiraClient.prototype, "rankIssue").mockResolvedValueOnce();
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", issueKey: "BP-1", rankAfter: "BP-3" });
+      const text = getText(result);
+      expect(text).toContain("BP-1");
+      expect(text).toContain("after BP-3");
+      expect(rankSpy).toHaveBeenCalledWith("BP-1", { rankAfter: "BP-3" });
+
+      rankSpy.mockRestore();
+    });
+
+    it("returns error when issueKey is missing", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", rankBefore: "BP-3" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("issueKey is required");
+    });
+
+    it("returns error when rank fails", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const rankSpy = vi.spyOn(JiraClient.prototype, "rankIssue").mockRejectedValueOnce(new Error("Rank API error"));
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", issueKey: "BP-1", rankBefore: "BP-3" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Rank API error");
+
+      rankSpy.mockRestore();
+    });
+
+    it("returns error when board ID not configured for position ranking", async () => {
+      delete process.env.JIRA_BOARD_ID;
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, { ...testSchema, boardId: "" });
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "rank", issueKey: "BP-1", position: "top" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Board ID is required");
+    });
+  });
+
+  describe("action=search (error handling)", () => {
+    it("returns error when jql is missing", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "search" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("jql is required");
+    });
+
+    it("returns error when search fails", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const searchSpy = vi
+        .spyOn(JiraClient.prototype, "searchBacklogIssues")
+        .mockRejectedValueOnce(new Error("Search API error"));
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "search", jql: "priority = High" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Search API error");
+
+      searchSpy.mockRestore();
+    });
+  });
+
+  describe("action=list (detectDuplicates)", () => {
+    it("detects duplicate issues when detectDuplicates=true", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      mockFetchResponse({
+        issues: [
+          {
+            key: "BP-1",
+            fields: {
+              summary: "Implement user authentication login flow",
+              issuetype: { name: "Story" },
+              priority: { name: "High" },
+              assignee: null,
+            },
+          },
+          {
+            key: "BP-2",
+            fields: {
+              summary: "Implement user authentication login process",
+              issuetype: { name: "Story" },
+              priority: { name: "Medium" },
+              assignee: null,
+            },
+          },
+          {
+            key: "BP-3",
+            fields: {
+              summary: "Fix database migration script",
+              issuetype: { name: "Bug" },
+              priority: { name: "Low" },
+              assignee: null,
+            },
+          },
+        ],
+        total: 3,
+      });
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "list", detectDuplicates: true });
+      const text = getText(result);
+      expect(text).toContain("Board Backlog");
+      expect(text).toContain("Potential Duplicates");
+      expect(text).toContain("BP-1");
+      expect(text).toContain("BP-2");
+    });
+
+    it("does not show duplicates section when no similar issues", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      mockFetchResponse({
+        issues: [
+          {
+            key: "BP-1",
+            fields: {
+              summary: "Implement authentication",
+              issuetype: { name: "Story" },
+              priority: { name: "High" },
+              assignee: null,
+            },
+          },
+          {
+            key: "BP-2",
+            fields: {
+              summary: "Fix database migration",
+              issuetype: { name: "Bug" },
+              priority: { name: "Low" },
+              assignee: null,
+            },
+          },
+        ],
+        total: 2,
+      });
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "list", detectDuplicates: true });
+      const text = getText(result);
+      expect(text).toContain("Board Backlog");
+      expect(text).not.toContain("Potential Duplicates");
+    });
+
+    it("handles list error gracefully", async () => {
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const backlogSpy = vi
+        .spyOn(JiraClient.prototype, "getBacklogIssues")
+        .mockRejectedValueOnce(new Error("API timeout"));
+
+      const backlog = getTool("backlog");
+      const result = await backlog({ action: "list" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("API timeout");
+
+      backlogSpy.mockRestore();
+    });
+  });
+
+  describe("action=search (JQL fallback — no board ID)", () => {
+    const noBoardSchema: JiraSchema = { ...testSchema, boardId: "" };
+
+    it("adds project scoping when JQL has no project filter", async () => {
+      delete process.env.JIRA_BOARD_ID;
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, noBoardSchema);
+
+      const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
+        issues: [],
+        total: 0,
+      });
+
+      const backlog = getTool("backlog");
+      await backlog({ action: "search", jql: "priority = High" });
+
+      const jql = searchSpy.mock.calls[0]?.[0] as string;
+      expect(jql).toContain("project = BP");
+      expect(jql).toContain("sprint is EMPTY");
+      expect(jql).toContain("priority = High");
+
+      searchSpy.mockRestore();
+    });
+
+    it("adds default ORDER BY rank when no ORDER BY specified", async () => {
+      delete process.env.JIRA_BOARD_ID;
+      const { server, getTool } = createMockServer();
+      registerBacklogTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, noBoardSchema);
+
+      const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
+        issues: [],
+        total: 0,
+      });
+
+      const backlog = getTool("backlog");
+      await backlog({ action: "search", jql: "priority = High" });
+
+      const jql = searchSpy.mock.calls[0]?.[0] as string;
+      expect(jql).toContain("ORDER BY rank ASC");
+
+      searchSpy.mockRestore();
+    });
   });
 });

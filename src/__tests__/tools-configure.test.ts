@@ -174,6 +174,46 @@ describe("action=set", () => {
     expect(result.content[0]?.text).toContain("Atlassian auth not configured");
   });
 
+  it("handles invalid JSON in existing config gracefully", async () => {
+    // Pre-populate config with invalid JSON to trigger catch in handleSet
+    kb.setConfig("atlassian", "this-is-not-json");
+
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", jiraProjectKey: "NEW" });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0]?.text).toContain("Saved");
+    expect(result.content[0]?.text).toContain("Project: NEW");
+
+    // Should have replaced the invalid JSON with valid config
+    const stored = JSON.parse(kb.getConfig("atlassian") ?? "{}");
+    expect(stored.jiraProjectKey).toBe("NEW");
+  });
+
+  it("saves boardId in config", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", jiraBoardId: "42" });
+    expect(result.content[0]?.text).toContain("Saved");
+    expect(result.content[0]?.text).toContain("Board: 42");
+  });
+
+  it("saves rootPageIds in config", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", rootPageIds: ["111", "222"] });
+    expect(result.content[0]?.text).toContain("Saved");
+
+    const stored = JSON.parse(kb.getConfig("atlassian") ?? "{}");
+    expect(stored.rootPageIds).toEqual(["111", "222"]);
+  });
+
   it("returns summary of saved settings", async () => {
     const { server, getTool } = createMockServer();
     registerConfigureTool(server, () => kb);
@@ -607,6 +647,351 @@ describe("action=setup", () => {
     expect(text).toContain("FAILED");
     expect(text).toContain("Jira search exploded");
     expect(text).toContain("Setup complete");
+  });
+
+  it("proceeds when projectKey present but boardId and spaces missing", async () => {
+    // Tests validateSetupParams returning null when projectKey is provided
+    // but boardId and spaces are missing (they're recommended, not required)
+    delete process.env.JIRA_BOARD_ID;
+
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery (no boardId passed)
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    // Mock learn-team: empty
+    mockSearchIssues.mockResolvedValue({ issues: [], total: 0 });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+    const text = result.content[0]?.text ?? "";
+
+    // Should succeed (not return validation error)
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain("Setup Results");
+    expect(text).toContain("Jira Schema");
+  });
+
+  it("merges setup config into invalid JSON gracefully", async () => {
+    // Pre-populate config with invalid JSON to test the catch block in persistSetupConfig
+    kb.setConfig("atlassian", "not-valid-json{{{");
+
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    // Mock learn-team: empty
+    mockSearchIssues.mockResolvedValue({ issues: [], total: 0 });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+    const text = result.content[0]?.text ?? "";
+
+    // Should succeed, starting fresh config
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain("Setup Results");
+
+    // Config should be valid JSON now
+    const stored = JSON.parse(kb.getConfig("atlassian") ?? "{}");
+    expect(stored.jiraProjectKey).toBe("BP");
+  });
+
+  it("returns error when auth env vars missing for setup", async () => {
+    delete process.env.ATLASSIAN_SITE_URL;
+    delete process.env.ATLASSIAN_EMAIL;
+    delete process.env.ATLASSIAN_API_TOKEN;
+
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it("maps ticket fields with missing nested values and assignee", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    // Return tickets with various edge cases to cover branches in mapIssueToTicket
+    mockSearchIssues.mockResolvedValue({
+      issues: [
+        {
+          key: "BP-1",
+          fields: {
+            summary: "Task with assignee",
+            description: "desc",
+            status: { name: "Done" },
+            issuetype: { name: "Story" },
+            priority: { name: "High" },
+            labels: ["backend"],
+            components: [{ name: "API" }, { notAName: true }], // second component has no .name
+            assignee: { displayName: "Alice" },
+            created: "2025-01-01T00:00:00Z",
+            updated: "2025-01-10T00:00:00Z",
+            resolutiondate: "2025-01-10T00:00:00Z",
+            story_points: 5,
+          },
+        },
+        {
+          key: "BP-2",
+          fields: {
+            // Missing or non-string fields to exercise fallback branches
+            summary: null, // non-string → fallback to ""
+            description: null, // adfToText returns ""
+            status: null, // nested name → "Unknown"
+            issuetype: null, // nested name → "Unknown"
+            priority: null, // nested name → "Medium"
+            labels: null, // falsy → []
+            components: null, // falsy → []
+            assignee: null, // null → null
+            created: 123, // non-string → fallback
+            updated: 456,
+            resolutiondate: null,
+          },
+        },
+      ],
+      total: 2,
+    });
+    mockGetIssueChangelog.mockResolvedValue([]);
+    mockAnalyzeBacklog.mockReturnValue({
+      rules: [],
+      totalTickets: 2,
+      qualityPassed: 1,
+      qualityFailed: 1,
+      avgQualityScore: 50.0,
+      rulesByCategory: {},
+    });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+    expect(result.isError).toBeFalsy();
+
+    // Verify analyzeBacklog was called with properly mapped tickets
+    const tickets = mockAnalyzeBacklog.mock.calls[0]?.[0] as Array<{
+      assignee: string | null;
+      components: string[];
+      status: string;
+      issueType: string;
+    }>;
+    // First ticket: has assignee
+    expect(tickets[0]?.assignee).toBe("Alice");
+    expect(tickets[0]?.components).toContain("API");
+    // Second ticket: missing fields fall back
+    expect(tickets[1]?.status).toBe("Unknown");
+    expect(tickets[1]?.issueType).toBe("Unknown");
+    expect(tickets[1]?.assignee).toBeNull();
+  });
+
+  it("handles multi-page ticket fetching", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    const makeIssue = (key: string) => ({
+      key,
+      fields: {
+        summary: `Task ${key}`,
+        description: "desc",
+        status: { name: "Done" },
+        issuetype: { name: "Task" },
+        priority: { name: "Medium" },
+        labels: [],
+        components: [],
+        created: "2025-01-01T00:00:00Z",
+        updated: "2025-01-02T00:00:00Z",
+        resolutiondate: null,
+      },
+    });
+
+    // To paginate: pageSize = min(50, maxTickets). First batch must return exactly pageSize items.
+    // maxTickets=3 → pageSize=3. First batch: 3 items, total=4. 3<3=false, 3>=4=false → continues.
+    // After first batch: allTickets=3, 3<3=false → while exits. Need maxTickets=4.
+    // maxTickets=4 → pageSize=4. First batch: 4 items, total=5. 4<4=false, 4>=5=false → continues.
+    // After first batch: allTickets=4, 4<4=false → while exits. Need maxTickets=5.
+    // maxTickets=5 → pageSize=5. First batch: 5 items, total=6. 5<5=false, 5>=6=false → continues.
+    // After first batch: allTickets=5, 5<5=false → while exits. Same issue.
+    // The while condition checks BEFORE the second iteration. So we need allTickets < maxTickets
+    // after first batch. First batch returns pageSize items. So maxTickets > pageSize.
+    // But pageSize = min(50, maxTickets), so pageSize = maxTickets when maxTickets <= 50.
+    // This means we can never paginate when maxTickets <= 50!
+    // Actually we CAN — pageSize = min(50, maxTickets). If maxTickets=100, pageSize=50.
+    // First batch: 50 items. allTickets=50 < 100 → continues.
+    mockSearchIssues
+      .mockResolvedValueOnce({
+        issues: Array.from({ length: 50 }, (_, i) => makeIssue(`BP-${i + 1}`)),
+        total: 52,
+      })
+      .mockResolvedValueOnce({
+        issues: [makeIssue("BP-51"), makeIssue("BP-52")],
+        total: 52,
+      });
+    mockGetIssueChangelog.mockResolvedValue([]);
+    mockAnalyzeBacklog.mockReturnValue({
+      rules: [],
+      totalTickets: 52,
+      qualityPassed: 52,
+      qualityFailed: 0,
+      avgQualityScore: 80.0,
+      rulesByCategory: {},
+    });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP", maxTickets: 100 });
+    expect(result.isError).toBeFalsy();
+
+    const tickets = mockAnalyzeBacklog.mock.calls[0]?.[0] as Array<{ key: string }>;
+    expect(tickets).toHaveLength(52);
+    expect(mockSearchIssues).toHaveBeenCalledTimes(2);
+  });
+
+  it("enriches changelogs with actual items from getIssueChangelog", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    // Mock learn-team: has ticket
+    mockSearchIssues.mockResolvedValue({
+      issues: [
+        {
+          key: "BP-1",
+          fields: {
+            summary: "Task 1",
+            description: "desc",
+            status: { name: "Done" },
+            issuetype: { name: "Task" },
+            priority: { name: "Medium" },
+            labels: [],
+            components: [],
+            created: "2025-01-01T00:00:00Z",
+            updated: "2025-01-02T00:00:00Z",
+            resolutiondate: "2025-01-02T00:00:00Z",
+          },
+        },
+      ],
+      total: 1,
+    });
+    // Return actual changelog entries with items to cover lines 120-127
+    mockGetIssueChangelog.mockResolvedValue([
+      {
+        created: "2025-01-01T12:00:00Z",
+        items: [
+          { field: "status", fromString: "To Do", toString: "In Progress" },
+          { field: "assignee", fromString: null, toString: "Alice" },
+        ],
+      },
+      {
+        created: "2025-01-02T12:00:00Z",
+        items: [{ field: "status", fromString: "In Progress", toString: "Done" }],
+      },
+    ]);
+    mockAnalyzeBacklog.mockReturnValue({
+      rules: [],
+      totalTickets: 1,
+      qualityPassed: 1,
+      qualityFailed: 0,
+      avgQualityScore: 75.0,
+      rulesByCategory: {},
+    });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+    const text = result.content[0]?.text ?? "";
+
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain("Team Conventions");
+    // Verify analyzeBacklog was called with tickets that have changelog entries
+    expect(mockAnalyzeBacklog).toHaveBeenCalledOnce();
+    const tickets = mockAnalyzeBacklog.mock.calls[0]?.[0] as Array<{ changelog: unknown[] }>;
+    expect(tickets[0]?.changelog).toHaveLength(3); // 2 + 1 items flattened
+  });
+
+  it("handles changelog fetch failure gracefully (catch branch)", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+
+    // Mock Jira discovery
+    mockFetchResponse({ key: "BP", name: "Backlog", id: "10000" });
+    mockFetchResponse({ values: [{ id: "1", name: "Task", subtask: false }] });
+    mockFetchResponse({ values: [] });
+    mockFetchResponse([{ id: "1", name: "Medium" }]);
+    mockFetchResponse([]);
+    mockFetchResponse({ issues: [] });
+
+    mockSearchIssues.mockResolvedValue({
+      issues: [
+        {
+          key: "BP-1",
+          fields: {
+            summary: "Task 1",
+            description: "desc",
+            status: { name: "Done" },
+            issuetype: { name: "Task" },
+            priority: { name: "Medium" },
+            labels: [],
+            components: [],
+            created: "2025-01-01T00:00:00Z",
+            updated: "2025-01-02T00:00:00Z",
+            resolutiondate: null,
+          },
+        },
+      ],
+      total: 1,
+    });
+    // Throw to trigger the catch branch at line 128
+    mockGetIssueChangelog.mockRejectedValue(new Error("Changelog fetch failed"));
+    mockAnalyzeBacklog.mockReturnValue({
+      rules: [],
+      totalTickets: 1,
+      qualityPassed: 1,
+      qualityFailed: 0,
+      avgQualityScore: 75.0,
+      rulesByCategory: {},
+    });
+
+    const configure = getTool("configure");
+    const result = await configure({ action: "setup", projectKey: "BP" });
+
+    expect(result.isError).toBeFalsy();
+    // Verify the ticket still has empty changelog (fallback to [])
+    const tickets = mockAnalyzeBacklog.mock.calls[0]?.[0] as Array<{ changelog: unknown[] }>;
+    expect(tickets[0]?.changelog).toEqual([]);
   });
 
   it("passes quality threshold to team analysis", async () => {

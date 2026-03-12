@@ -1,13 +1,58 @@
 import { buildJiraClient, errorResponse, resolveConfig, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
+import { findDuplicates } from "../lib/duplicate-detect.js";
 import { JiraClient, type JiraTicketInput } from "../lib/jira.js";
-import { DEFAULT_RULES, formatTeamStyleGuide, mergeWithDefaults } from "../lib/team-rules.js";
-import {
-  buildConfluenceSection,
-  buildSchemaGuidance,
-  FIELD_RULES,
-  retrieveConfluenceContext,
-} from "./issues-helpers.js";
+import { DEFAULT_RULES, mergeWithDefaults } from "../lib/team-rules.js";
+import { evaluateConventions } from "../lib/team-rules-format.js";
+import { buildKbContextSection, buildSchemaGuidance, FIELD_RULES, retrieveKbContext } from "./issues-helpers.js";
+import { buildBulkPreviewCard, buildPreviewCard, type PreviewData } from "./preview-builder.js";
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function loadTeamRules(kb: KnowledgeBase) {
+  const teamRules = kb.getTeamRules();
+  return teamRules.map((r) => ({
+    category: r.category,
+    rule_key: r.rule_key,
+    issue_type: r.issue_type,
+    rule_value: r.rule_value,
+    confidence: r.confidence,
+    sample_size: r.sample_size,
+  }));
+}
+
+function buildFields(params: {
+  summary: string;
+  issueType: string;
+  priority?: string;
+  labels?: string[];
+  storyPoints?: number;
+  components?: string[];
+  parent?: string;
+  parentKey?: string;
+  namedFields?: Record<string, string | null>;
+}): Array<{ label: string; value: string }> {
+  const fields: Array<{ label: string; value: string }> = [
+    { label: "Summary", value: params.summary },
+    { label: "Type", value: params.issueType },
+    { label: "Priority", value: params.priority || "Medium (default)" },
+  ];
+  if (params.labels?.length) fields.push({ label: "Labels", value: params.labels.join(", ") });
+  if (params.storyPoints != null) fields.push({ label: "Story Points", value: String(params.storyPoints) });
+  if (params.components?.length) fields.push({ label: "Components", value: params.components.join(", ") });
+  if (params.parent || params.parentKey)
+    fields.push({ label: "Parent", value: (params.parent || params.parentKey) as string });
+  if (params.namedFields)
+    fields.push({
+      label: "Custom Fields",
+      value: Object.entries(params.namedFields)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(", "),
+    });
+  return fields;
+}
+
+// ── Create ───────────────────────────────────────────────────────────────────
 
 /** Handle the 'create' action (preview + confirm flow). */
 export async function handleCreateAction(
@@ -34,67 +79,65 @@ export async function handleCreateAction(
     const schema = JiraClient.loadSchemaFromDb(kb);
     const issueType = params.issueType || "Task";
     const searchText = `${params.summary} ${params.description || ""}`;
-    const ctx = retrieveConfluenceContext(kb, searchText, params.spaceKey);
+    const ctx = retrieveKbContext(kb, searchText, params.spaceKey);
 
-    let out = `# Ticket Preview\n\n`;
-    out += `| Field | Value |\n|-------|-------|\n`;
-    out += `| Summary | ${params.summary} |\n`;
-    out += `| Type | ${issueType} |\n`;
-    out += `| Priority | ${params.priority || "Medium (default)"} |\n`;
-    if (params.labels?.length) out += `| Labels | ${params.labels.join(", ")} |\n`;
-    if (params.storyPoints != null) out += `| Story Points | ${params.storyPoints} |\n`;
-    if (params.components?.length) out += `| Components | ${params.components.join(", ")} |\n`;
-    if (params.parent || params.parentKey) out += `| Parent | ${params.parent || params.parentKey} |\n`;
-    if (params.namedFields)
-      out += `| Custom Fields | ${Object.entries(params.namedFields)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(", ")} |\n`;
-    out += `\n`;
-    if (params.description) out += `## Description\n${params.description}\n\n`;
+    // Duplicate detection
+    let duplicates: Awaited<ReturnType<typeof findDuplicates>> = [];
+    let epicsSection = "";
+    try {
+      const { jira, config } = buildJiraClient(kb);
+      const projectKey = config.jiraProjectKey;
+      if (projectKey) {
+        duplicates = await findDuplicates(jira, params.summary, params.description, projectKey);
+      }
 
-    out += buildSchemaGuidance(schema, issueType);
-
-    // Load team rules
-    const teamRules = kb.getTeamRules();
-    const rules = teamRules.map((r) => ({
-      category: r.category,
-      rule_key: r.rule_key,
-      issue_type: r.issue_type,
-      rule_value: r.rule_value,
-      confidence: r.confidence,
-      sample_size: r.sample_size,
-    }));
-    const merged = mergeWithDefaults(rules, DEFAULT_RULES);
-    const styleGuide = formatTeamStyleGuide(merged);
-    if (styleGuide.trim()) out += `\n${styleGuide}\n`;
-
-    out += buildConfluenceSection(ctx);
-
-    // List available epics if no parent specified
-    // Epics are project-level — always use JQL search, not board-scoped endpoint
-    if (!params.parent && !params.parentKey) {
-      try {
-        const { jira, config } = buildJiraClient(kb);
-        const projectKey = config.jiraProjectKey;
-        const epicJql = projectKey
-          ? `project = ${projectKey} AND type = Epic AND status != Done ORDER BY updated DESC`
-          : `type = Epic AND status != Done ORDER BY updated DESC`;
+      // List available epics if no parent specified
+      if (!params.parent && !params.parentKey && projectKey) {
+        const epicJql = `project = ${projectKey} AND type = Epic AND status != Done ORDER BY updated DESC`;
         const epicResult = await jira.searchIssues(epicJql, undefined, 10);
         if (epicResult.issues.length > 0) {
-          out += `\n## Available Epics\n\n`;
-          out += `No parent epic specified. Consider assigning to one of these:\n\n`;
-          out += `| Key | Summary | Status |\n|-----|---------|--------|\n`;
+          epicsSection += `\n## Available Epics\n\n`;
+          epicsSection += `No parent epic specified. Consider assigning to one of these:\n\n`;
+          epicsSection += `| Key | Summary | Status |\n|-----|---------|--------|\n`;
           for (const epic of epicResult.issues) {
-            out += `| ${epic.key} | ${epic.fields.summary} | ${epic.fields.status?.name ?? "-"} |\n`;
+            epicsSection += `| ${epic.key} | ${epic.fields.summary} | ${epic.fields.status?.name ?? "-"} |\n`;
           }
-          out += `\nTo assign, add \`parentKey\` to the create call.\n`;
+          epicsSection += `\nTo assign, add \`parentKey\` to the create call.\n`;
         }
-      } catch {
-        // Epic listing is best-effort — don't fail the preview
       }
+    } catch {
+      // Duplicate check and epic listing are best-effort
     }
 
-    out += FIELD_RULES;
+    // Team conventions
+    const rules = loadTeamRules(kb);
+    const merged = mergeWithDefaults(rules, DEFAULT_RULES);
+    const conventions = evaluateConventions(
+      {
+        summary: params.summary,
+        description: params.description,
+        issueType,
+        labels: params.labels,
+        storyPoints: params.storyPoints,
+        components: params.components,
+      },
+      merged,
+    );
+
+    const kbContextText = buildKbContextSection(ctx);
+
+    const previewData: PreviewData = {
+      fields: buildFields({ summary: params.summary, issueType, ...params }),
+      description: params.description,
+      conventions,
+      kbContext: kbContextText,
+      duplicates,
+      schemaGuidance: buildSchemaGuidance(schema, issueType),
+      fieldRules: FIELD_RULES,
+    };
+
+    let out = buildPreviewCard(previewData);
+    if (epicsSection) out += `\n\n${epicsSection}`;
     out += `\n---\n**STOP: Show this preview to the user and wait for their approval.** Do NOT proceed with \`confirmed=true\` until the user explicitly confirms. Ask the user to review the fields, description, and epic assignment above.\n`;
     return textResponse(out);
   }
@@ -121,6 +164,8 @@ export async function handleCreateAction(
     return errorResponse(`Failed to create issue: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+
+// ── Bulk Create ──────────────────────────────────────────────────────────────
 
 /** Handle the 'bulk-create' action (preview + confirm flow). */
 export async function handleBulkCreateAction(
@@ -156,47 +201,63 @@ export async function handleBulkCreateAction(
   if (!params.confirmed) {
     const schema = JiraClient.loadSchemaFromDb(kb);
     const issueType = params.tickets[0]?.issueType || "Task";
-
     const searchText = params.tickets.map((t) => t.summary).join(" ");
-    const ctx = retrieveConfluenceContext(kb, searchText, params.spaceKey);
+    const ctx = retrieveKbContext(kb, searchText, params.spaceKey);
+    const kbContextText = buildKbContextSection(ctx);
 
-    const ticketCount = params.tickets.length;
-    const plural = ticketCount === 1 ? "" : "s";
-
-    let out = `# Ticket Preview: ${ticketCount} ticket${plural}\n`;
-    out += `Project: ${projectKey || "(not set)"}\n\n`;
-
-    for (const [i, t] of params.tickets.entries()) {
-      const componentsList = t.components.join(",");
-      const meta = [
-        t.issueType,
-        t.priority,
-        t.storyPoints == null ? "" : `${t.storyPoints}pts`,
-        t.labels.length ? t.labels.join(",") : "",
-        t.parentKey ? `parent: ${t.parentKey}` : "",
-        t.components.length ? `components: ${componentsList}` : "",
-      ].filter(Boolean);
-      out += `${i + 1}. **${t.summary}** [${meta.join(" | ")}]\n${t.description || "(no description)"}\n\n`;
+    // Duplicate detection for first ticket (best-effort)
+    let firstDuplicates: Awaited<ReturnType<typeof findDuplicates>> = [];
+    try {
+      if (projectKey) {
+        const { jira } = buildJiraClient(kb);
+        const first = params.tickets[0];
+        if (first) {
+          firstDuplicates = await findDuplicates(jira, first.summary, first.description, projectKey);
+        }
+      }
+    } catch {
+      // best-effort
     }
 
-    out += buildSchemaGuidance(schema, issueType);
-
-    // Load team rules
-    const teamRules = kb.getTeamRules();
-    const rules = teamRules.map((r) => ({
-      category: r.category,
-      rule_key: r.rule_key,
-      issue_type: r.issue_type,
-      rule_value: r.rule_value,
-      confidence: r.confidence,
-      sample_size: r.sample_size,
-    }));
+    // Team conventions
+    const rules = loadTeamRules(kb);
     const merged = mergeWithDefaults(rules, DEFAULT_RULES);
-    const styleGuide = formatTeamStyleGuide(merged);
-    if (styleGuide.trim()) out += `\n${styleGuide}\n`;
+    const schemaGuidance = buildSchemaGuidance(schema, issueType);
 
-    out += buildConfluenceSection(ctx);
-    out += FIELD_RULES;
+    const previews: PreviewData[] = params.tickets.map((t, i) => {
+      const conventions = evaluateConventions(
+        {
+          summary: t.summary,
+          description: t.description,
+          issueType: t.issueType,
+          labels: t.labels,
+          storyPoints: t.storyPoints,
+          components: t.components,
+        },
+        merged,
+      );
+      const fields: Array<{ label: string; value: string }> = [
+        { label: "Summary", value: t.summary },
+        { label: "Type", value: t.issueType },
+        { label: "Priority", value: t.priority },
+      ];
+      if (t.labels.length) fields.push({ label: "Labels", value: t.labels.join(", ") });
+      if (t.storyPoints != null) fields.push({ label: "Story Points", value: String(t.storyPoints) });
+      if (t.parentKey) fields.push({ label: "Parent", value: t.parentKey });
+      if (t.components.length) fields.push({ label: "Components", value: t.components.join(", ") });
+
+      return {
+        fields,
+        description: t.description,
+        conventions,
+        kbContext: i === 0 ? kbContextText : undefined,
+        duplicates: i === 0 ? firstDuplicates : [],
+        schemaGuidance: i === 0 ? schemaGuidance : undefined,
+        fieldRules: i === 0 ? FIELD_RULES : undefined,
+      };
+    });
+
+    let out = buildBulkPreviewCard(previews);
     out += `\n---\n**STOP: Show this preview to the user and wait for their approval.** Do NOT proceed with \`confirmed=true\` until the user explicitly confirms. Ask the user to review the tickets above.\n`;
     return textResponse(out);
   }

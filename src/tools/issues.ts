@@ -4,15 +4,16 @@ import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
 import { JiraClient } from "../lib/jira.js";
 import { DEFAULT_RULES, formatTeamStyleGuide, mergeWithDefaults } from "../lib/team-rules.js";
+import { evaluateConventions, formatConventionsSection } from "../lib/team-rules-format.js";
 import { handleBulkCreateAction, handleCreateAction } from "./issues-create.js";
 import { handleGetAction, handleSearchAction } from "./issues-get.js";
 import {
   boolPreprocess,
-  buildConfluenceSection,
+  buildKbContextSection,
   buildSchemaGuidance,
   FIELD_RULES,
   jsonPreprocess,
-  retrieveConfluenceContext,
+  retrieveKbContext,
 } from "./issues-helpers.js";
 
 // ── Barrel re-exports ─────────────────────────────────────────────────────────
@@ -313,7 +314,7 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
 
           // Retrieve Confluence context for the epic description
           const epicDescription = epic.description || epic.summary;
-          const ctx = retrieveConfluenceContext(kb, epicDescription, params.spaceKey);
+          const ctx = retrieveKbContext(kb, epicDescription, params.spaceKey);
 
           const issueType = params.issueType || "Task";
 
@@ -356,7 +357,15 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
             plan += `\n${styleGuide}\n`;
           }
 
-          plan += buildConfluenceSection(ctx);
+          // Evaluate conventions for the epic as a representative ticket
+          const conventions = evaluateConventions(
+            { summary: epic.summary, description: epic.description, issueType, labels: epic.labels },
+            merged,
+          );
+          const conventionsText = formatConventionsSection(conventions);
+          if (conventionsText) plan += `\n${conventionsText}\n\n`;
+
+          plan += buildKbContextSection(ctx);
 
           plan += `---\nUse **issues** (action=create or bulk-create) with parentKey="${params.epicKey}" to create child stories.\n`;
           plan += FIELD_RULES;

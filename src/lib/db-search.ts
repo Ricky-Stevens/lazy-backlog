@@ -20,14 +20,25 @@ export function sanitizeFtsQuery(query: string): string {
   return words.map((w) => `"${w}"`).join(" ");
 }
 
-// ── Search helpers ──────────────────────────────────────────────────────────
+// ── Filter key + dynamic dispatch ────────────────────────────────────────────
 
-/** Prepared statement variants for filtered queries. */
-export interface FilteredStatements {
-  none: Statement;
-  type: Statement;
-  space: Statement;
-  both: Statement;
+/** Derive a canonical key from active filter fields. */
+function filterKey(f: SearchFilter): string {
+  const parts: string[] = [];
+  if (f.source) parts.push("source");
+  if (f.pageType) parts.push("type");
+  if (f.spaceKey) parts.push("space");
+  return parts.join("_") || "none";
+}
+
+/** Build the positional params array: [query, ...activeFilters, limit]. */
+function buildParams(query: string, filter: SearchFilter, defaultLimit: number): unknown[] {
+  const params: unknown[] = [query];
+  if (filter.source) params.push(filter.source);
+  if (filter.pageType) params.push(filter.pageType);
+  if (filter.spaceKey) params.push(filter.spaceKey);
+  params.push(filter.limit || defaultLimit);
+  return params;
 }
 
 /**
@@ -36,29 +47,28 @@ export interface FilteredStatements {
  * returns `unknown[]` — the caller knows the row shape from the SQL.
  */
 export function runFilteredQuery<T>(
-  stmts: FilteredStatements,
+  stmts: Record<string, Statement>,
   query: string,
   filter: SearchFilter,
   defaultLimit: number,
 ): T[] {
-  const limit = filter.limit || defaultLimit;
-  if (filter.pageType && filter.spaceKey) {
-    return stmts.both.all(query, filter.pageType, filter.spaceKey, limit) as T[];
-  }
-  if (filter.pageType) {
-    return stmts.type.all(query, filter.pageType, limit) as T[];
-  }
-  if (filter.spaceKey) {
-    return stmts.space.all(query, filter.spaceKey, limit) as T[];
-  }
-  return stmts.none.all(query, limit) as T[];
+  const key = filterKey(filter);
+  const stmt = stmts[key];
+  if (!stmt) throw new Error(`No prepared statement for filter key: ${key}`);
+  const params = buildParams(query, filter, defaultLimit);
+  return stmt.all(...params) as T[];
 }
 
 /**
  * Execute an FTS5 query after sanitizing user input.
  * Returns empty array for empty/whitespace-only queries.
  */
-export function ftsQuery<T>(query: string, filter: SearchFilter, defaultLimit: number, stmts: FilteredStatements): T[] {
+export function ftsQuery<T>(
+  query: string,
+  filter: SearchFilter,
+  defaultLimit: number,
+  stmts: Record<string, Statement>,
+): T[] {
   const sanitized = sanitizeFtsQuery(query);
   if (sanitized === "") return [];
   try {
@@ -74,37 +84,52 @@ export function ftsQuery<T>(query: string, filter: SearchFilter, defaultLimit: n
 
 // ── Search functions (delegated from KnowledgeBase) ─────────────────────────
 
-/** Page-level search statement keys used by the KnowledgeBase. */
+/** All search statement variants keyed by filter combination, for pages and chunks. */
 export interface SearchStatements {
-  none: Statement;
-  type: Statement;
-  space: Statement;
-  both: Statement;
-  chunkNone: Statement;
-  chunkType: Statement;
-  chunkSpace: Statement;
-  chunkBoth: Statement;
+  [key: string]: Statement;
 }
 
 /** Full-text search across indexed pages. Falls back to phrase escaping on FTS5 syntax errors. */
 export function searchPages(query: string, options: SearchFilter, searchStmts: SearchStatements): SearchResult[] {
-  const { none, type, space, both } = searchStmts;
-  return ftsQuery<SearchResult>(query, options, 10, { none, type, space, both });
+  // Extract page-level statements (keys without "chunk_" prefix)
+  const pageStmts: Record<string, Statement> = {};
+  for (const [k, v] of Object.entries(searchStmts)) {
+    if (!k.startsWith("chunk_")) pageStmts[k] = v;
+  }
+  return ftsQuery<SearchResult>(query, options, 10, pageStmts);
 }
 
 /** Search chunks — returns focused sections with heading breadcrumbs. */
 export function searchChunks(query: string, options: SearchFilter, searchStmts: SearchStatements): ChunkSearchResult[] {
-  const { chunkNone: none, chunkType: type, chunkSpace: space, chunkBoth: both } = searchStmts;
-  return ftsQuery<ChunkSearchResult>(query, options, 5, { none, type, space, both });
+  // Extract chunk-level statements (strip "chunk_" prefix)
+  const chunkStmts: Record<string, Statement> = {};
+  for (const [k, v] of Object.entries(searchStmts)) {
+    if (k.startsWith("chunk_")) chunkStmts[k.slice(6)] = v;
+  }
+  return ftsQuery<ChunkSearchResult>(query, options, 5, chunkStmts);
 }
+
+// ── Filter clause combinations ───────────────────────────────────────────────
+
+/** All possible filter keys and their SQL WHERE clause fragments. */
+const FILTER_COMBOS: Array<{ key: string; clause: string }> = [
+  { key: "none", clause: "" },
+  { key: "source", clause: " AND p.source = ?" },
+  { key: "type", clause: " AND p.page_type = ?" },
+  { key: "space", clause: " AND p.space_key = ?" },
+  { key: "source_type", clause: " AND p.source = ? AND p.page_type = ?" },
+  { key: "source_space", clause: " AND p.source = ? AND p.space_key = ?" },
+  { key: "type_space", clause: " AND p.page_type = ? AND p.space_key = ?" },
+  { key: "source_type_space", clause: " AND p.source = ? AND p.page_type = ? AND p.space_key = ?" },
+];
 
 // ── Search statement preparation ────────────────────────────────────────────
 
-/** Pre-prepare all 4 search filter combinations to avoid dynamic SQL. */
+/** Pre-prepare all 8 page + 8 chunk search filter combinations. */
 export function prepareSearchVariants(db: SqliteDatabase): SearchStatements {
   // Page-level search (legacy, still useful for title/label matching)
   const pageBase = (filters: string) => `
-    SELECT p.id, p.space_key, p.title, p.url, p.page_type, p.labels,
+    SELECT p.id, p.space_key, p.title, p.url, p.page_type, p.labels, p.source,
       snippet(pages_fts, 1, '**', '**', '…', 48) AS snippet, rank
     FROM pages_fts
     JOIN pages p ON p.rowid = pages_fts.rowid
@@ -115,7 +140,7 @@ export function prepareSearchVariants(db: SqliteDatabase): SearchStatements {
   // Chunk-level search (primary — returns focused sections with breadcrumbs)
   const chunkBase = (filters: string) => `
     SELECT c.id as chunk_id, c.page_id, c.breadcrumb, c.heading, c.depth,
-      p.space_key, p.title as page_title, p.url, p.page_type, p.labels,
+      p.space_key, p.title as page_title, p.url, p.page_type, p.labels, p.source,
       snippet(chunks_fts, 2, '**', '**', '…', 48) AS snippet, rank
     FROM chunks_fts
     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -124,14 +149,10 @@ export function prepareSearchVariants(db: SqliteDatabase): SearchStatements {
     ORDER BY rank LIMIT ?
   `;
 
-  return {
-    none: db.prepare(pageBase("")),
-    type: db.prepare(pageBase(" AND p.page_type = ?")),
-    space: db.prepare(pageBase(" AND p.space_key = ?")),
-    both: db.prepare(pageBase(" AND p.page_type = ? AND p.space_key = ?")),
-    chunkNone: db.prepare(chunkBase("")),
-    chunkType: db.prepare(chunkBase(" AND p.page_type = ?")),
-    chunkSpace: db.prepare(chunkBase(" AND p.space_key = ?")),
-    chunkBoth: db.prepare(chunkBase(" AND p.page_type = ? AND p.space_key = ?")),
-  };
+  const stmts: SearchStatements = {};
+  for (const { key, clause } of FILTER_COMBOS) {
+    stmts[key] = db.prepare(pageBase(clause));
+    stmts[`chunk_${key}`] = db.prepare(chunkBase(clause));
+  }
+  return stmts;
 }

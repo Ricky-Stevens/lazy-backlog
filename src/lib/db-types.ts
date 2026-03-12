@@ -15,6 +15,7 @@ export interface IndexedPage {
   created_at: string | null;
   updated_at: string | null;
   indexed_at: string;
+  source: string;
 }
 
 /** Lightweight projection — no content body. */
@@ -27,6 +28,7 @@ export interface PageSummary {
   labels: string;
   updated_at: string | null;
   content_preview: string;
+  source: string;
 }
 
 export interface SearchResult {
@@ -38,6 +40,7 @@ export interface SearchResult {
   page_type: PageType;
   labels: string;
   rank: number;
+  source: string;
 }
 
 export interface ChunkSearchResult {
@@ -53,6 +56,7 @@ export interface ChunkSearchResult {
   labels: string;
   snippet: string;
   rank: number;
+  source: string;
 }
 
 export interface CachedSprint {
@@ -103,6 +107,7 @@ export interface BacklogAnalysisRecord {
 
 /** Filter options shared by page and chunk search. */
 export interface SearchFilter {
+  source?: string;
   pageType?: string;
   spaceKey?: string;
   limit?: number;

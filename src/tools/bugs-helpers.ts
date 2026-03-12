@@ -2,6 +2,8 @@ import type { ProjectConfig } from "../config/schema.js";
 import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
 import type { JiraClient } from "../lib/jira.js";
+import { DEFAULT_RULES, mergeWithDefaults } from "../lib/team-rules.js";
+import { evaluateConventions, formatConventionsSection } from "../lib/team-rules-format.js";
 import { assessCompleteness, inferSeverity, type ToolResponse } from "./bugs.js";
 
 // ── find-bugs ────────────────────────────────────────────────────────────────
@@ -143,6 +145,7 @@ async function triageSingleIssue(
   params: { severity?: string; autoUpdate?: boolean; autoAssign?: boolean },
   jira: JiraClient,
   config: ProjectConfig,
+  kb: KnowledgeBase,
 ): Promise<string> {
   const issue = await jira.getIssue(issueKey);
   const text = `${issue.summary} ${issue.description || ""}`;
@@ -162,6 +165,34 @@ async function triageSingleIssue(
   const boardId = config.jiraBoardId;
   if (boardId) {
     out += await assignSprint(issueKey, severity, jira, boardId, params.autoAssign ?? false);
+  }
+
+  // Evaluate team conventions for the bug
+  try {
+    const teamRules = kb.getTeamRules();
+    const rules = teamRules.map((r) => ({
+      category: r.category,
+      rule_key: r.rule_key,
+      issue_type: r.issue_type,
+      rule_value: r.rule_value,
+      confidence: r.confidence,
+      sample_size: r.sample_size,
+    }));
+    const merged = mergeWithDefaults(rules, DEFAULT_RULES);
+    const conventions = evaluateConventions(
+      {
+        summary: issue.summary,
+        description: issue.description,
+        issueType: "Bug",
+        labels: issue.labels,
+        components: issue.components,
+      },
+      merged,
+    );
+    const conventionsText = formatConventionsSection(conventions);
+    if (conventionsText) out += `\n${conventionsText}\n`;
+  } catch {
+    // conventions are best-effort
   }
 
   return out;
@@ -318,7 +349,7 @@ export async function handleTriage(
 
     if (params.issueKeys.length === 1) {
       const issueKey = params.issueKeys[0] as string;
-      const out = await triageSingleIssue(issueKey, params, jira, config);
+      const out = await triageSingleIssue(issueKey, params, jira, config, kb);
       return textResponse(out);
     }
 

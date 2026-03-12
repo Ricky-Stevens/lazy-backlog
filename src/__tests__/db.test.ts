@@ -1,9 +1,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CachedChangelogEntry, CachedSprint, IndexedPage } from "../lib/db.js";
-import { KnowledgeBase, sanitizeFtsQuery } from "../lib/db.js";
+import { KnowledgeBase, ftsQuery, sanitizeFtsQuery } from "../lib/db.js";
 
 /** Create a minimal IndexedPage for testing. */
 function makePage(overrides: Partial<IndexedPage> = {}): IndexedPage {
@@ -20,6 +20,7 @@ function makePage(overrides: Partial<IndexedPage> = {}): IndexedPage {
     created_at: overrides.created_at ?? "2025-01-01T00:00:00Z",
     updated_at: overrides.updated_at ?? "2025-06-01T00:00:00Z",
     indexed_at: overrides.indexed_at ?? new Date().toISOString(),
+    source: overrides.source ?? "confluence",
   };
 }
 
@@ -686,6 +687,108 @@ describe("backlog analysis", () => {
   it("getLatestAnalysis returns null when no analysis exists", () => {
     const latest = kb.getLatestAnalysis();
     expect(latest).toBeNull();
+  });
+});
+
+// ── Search with source filter ────────────────────────────────────────────
+
+describe("search with source filter", () => {
+  it("filters pages by source", () => {
+    kb.upsertPage(makePage({ id: "1", source: "confluence", content: "gamma delta content" }));
+    kb.upsertPage(makePage({ id: "2", source: "manual", content: "gamma delta content" }));
+
+    const results = kb.search("gamma", { source: "confluence" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.source).toBe("confluence");
+  });
+
+  it("filters by source and pageType", () => {
+    kb.upsertPage(makePage({ id: "1", source: "confluence", page_type: "adr", content: "sigma tau content" }));
+    kb.upsertPage(makePage({ id: "2", source: "confluence", page_type: "design", content: "sigma tau content" }));
+    kb.upsertPage(makePage({ id: "3", source: "manual", page_type: "adr", content: "sigma tau content" }));
+
+    const results = kb.search("sigma", { source: "confluence", pageType: "adr" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.id).toBe("1");
+  });
+
+  it("filters by source and spaceKey", () => {
+    kb.upsertPage(makePage({ id: "1", source: "confluence", space_key: "ENG", content: "omega phi content" }));
+    kb.upsertPage(makePage({ id: "2", source: "manual", space_key: "ENG", content: "omega phi content" }));
+    kb.upsertPage(makePage({ id: "3", source: "confluence", space_key: "PM", content: "omega phi content" }));
+
+    const results = kb.search("omega", { source: "confluence", spaceKey: "ENG" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.id).toBe("1");
+  });
+
+  it("filters by source, pageType, and spaceKey", () => {
+    kb.upsertPage(
+      makePage({ id: "1", source: "confluence", page_type: "adr", space_key: "ENG", content: "psi chi content" }),
+    );
+    kb.upsertPage(
+      makePage({ id: "2", source: "confluence", page_type: "adr", space_key: "PM", content: "psi chi content" }),
+    );
+    kb.upsertPage(
+      makePage({ id: "3", source: "manual", page_type: "adr", space_key: "ENG", content: "psi chi content" }),
+    );
+    kb.upsertPage(
+      makePage({ id: "4", source: "confluence", page_type: "design", space_key: "ENG", content: "psi chi content" }),
+    );
+
+    const results = kb.search("psi", { source: "confluence", pageType: "adr", spaceKey: "ENG" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.id).toBe("1");
+  });
+
+  it("filters chunks by source", () => {
+    kb.upsertPage(makePage({ id: "p1", source: "confluence", content: "page" }));
+    kb.upsertPage(makePage({ id: "p2", source: "manual", content: "page" }));
+    kb.upsertChunks("p1", [
+      { breadcrumb: "", heading: "H", depth: 1, content: "epsilon zeta unique content", index: 0 },
+    ]);
+    kb.upsertChunks("p2", [
+      { breadcrumb: "", heading: "H", depth: 1, content: "epsilon zeta unique content", index: 0 },
+    ]);
+
+    const results = kb.searchChunks("epsilon", { source: "confluence" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.source).toBe("confluence");
+  });
+});
+
+// ── ftsQuery FTS5 error fallback (lines 77-81) ──────────────────────────
+
+describe("ftsQuery FTS5 error fallback", () => {
+  it("falls back to phrase-wrapping on fts5 syntax error", () => {
+    const fallbackResult = [{ id: "1", title: "found" }];
+    let callCount = 0;
+    const mockStmt = {
+      all: vi.fn((..._args: unknown[]) => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("fts5: syntax error near something");
+        }
+        return fallbackResult;
+      }),
+    };
+    const stmts = { none: mockStmt };
+
+    const results = ftsQuery<{ id: string }>("test query", {}, 10, stmts as never);
+    expect(results).toEqual(fallbackResult);
+    expect(mockStmt.all).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-throws non-fts5 errors without fallback", () => {
+    const mockStmt = {
+      all: vi.fn(() => {
+        throw new Error("SQLITE_ERROR: some other error");
+      }),
+    };
+    const stmts = { none: mockStmt };
+
+    expect(() => ftsQuery("test query", {}, 10, stmts as never)).toThrow("SQLITE_ERROR: some other error");
+    expect(mockStmt.all).toHaveBeenCalledTimes(1);
   });
 });
 

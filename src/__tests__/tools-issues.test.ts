@@ -8,7 +8,7 @@ import { JiraClient, type JiraIssueDetail, type JiraSchema } from "../lib/jira.j
 import { registerIssuesTool } from "../tools/issues.js";
 import {
   boolPreprocess,
-  buildConfluenceSection,
+  buildKbContextSection,
   buildSchemaGuidance,
   extractKeywords,
   formatBoardInfo,
@@ -350,7 +350,7 @@ describe("registerIssuesTool", () => {
         summary: "Default fields",
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("| Type | Task |");
+      expect(text).toContain("| **Type** | Task |");
       expect(text).toContain("Medium (default)");
     });
 
@@ -367,8 +367,8 @@ describe("registerIssuesTool", () => {
         priority: "High",
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("| Type | Bug |");
-      expect(text).toContain("| Priority | High |");
+      expect(text).toContain("| **Type** | Bug |");
+      expect(text).toContain("| **Priority** | High |");
     });
 
     it("preview lists available epics when no parent specified", async () => {
@@ -419,8 +419,9 @@ describe("registerIssuesTool", () => {
       });
       const text = result.content[0]?.text ?? "";
       expect(text).not.toContain("Available Epics");
-      // searchIssues should not have been called for epic listing
-      expect(searchSpy).not.toHaveBeenCalled();
+      // searchIssues may be called for duplicate detection, but not for epic listing
+      const epicCalls = searchSpy.mock.calls.filter((c) => String(c[0]).includes("type = Epic"));
+      expect(epicCalls).toHaveLength(0);
 
       searchSpy.mockRestore();
     });
@@ -625,7 +626,7 @@ describe("registerIssuesTool", () => {
         ],
       });
       const text = result.content[0]?.text;
-      expect(text).toContain("Ticket Preview");
+      expect(text).toContain("Bulk Preview");
       expect(text).toContain("confirmed=true");
     });
 
@@ -800,12 +801,12 @@ describe("registerIssuesTool", () => {
         ],
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("5pts");
-      expect(text).toContain("parent: BP-10");
-      expect(text).toContain("components: frontend");
-      expect(text).toContain("auth");
-      expect(text).toContain("Story");
-      expect(text).toContain("High");
+      expect(text).toContain("| **Story Points** | 5 |");
+      expect(text).toContain("| **Parent** | BP-10 |");
+      expect(text).toContain("| **Components** | frontend |");
+      expect(text).toContain("| **Labels** | auth |");
+      expect(text).toContain("| **Type** | Story |");
+      expect(text).toContain("| **Priority** | High |");
     });
 
     it("preview shows (no description) when ticket lacks description", async () => {
@@ -827,7 +828,7 @@ describe("registerIssuesTool", () => {
         ],
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("(no description)");
+      expect(text).not.toContain("**Description:**");
     });
 
     it("preview uses singular 'ticket' for single ticket", async () => {
@@ -849,7 +850,7 @@ describe("registerIssuesTool", () => {
         ],
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("1 ticket\n");
+      expect(text).toContain("1 ticket)");
       expect(text).not.toContain("1 tickets");
     });
 
@@ -969,7 +970,9 @@ describe("registerIssuesTool", () => {
         ],
       });
       const text = result.content[0]?.text ?? "";
-      expect(text).toContain("(not set)");
+      // Preview still renders without a project key
+      expect(text).toContain("Bulk Preview");
+      expect(text).toContain("No project key");
     });
   });
 
@@ -1758,6 +1761,170 @@ describe("registerIssuesTool", () => {
     });
   });
 
+  // ── action=update — error catch branch (line 230) ──────────────────────────
+
+  describe("action=update (error branch)", () => {
+    it("returns error when update throws", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const updateSpy = vi
+        .spyOn(JiraClient.prototype, "updateIssue")
+        .mockRejectedValue(new Error("Permission denied"));
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "update", issueKey: "BP-1", summary: "Try update" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Failed to update BP-1");
+      expect(getText(result)).toContain("Permission denied");
+
+      updateSpy.mockRestore();
+    });
+
+    it("returns error when issueKey missing for update", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "update" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("issueKey is required");
+    });
+  });
+
+  // ── action=epic-progress — error catch branch (line 297) ──────────────────
+
+  describe("action=epic-progress (error branch)", () => {
+    it("returns error when getEpicIssues throws", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const epicSpy = (vi.spyOn as (...args: unknown[]) => ReturnType<typeof vi.spyOn>)(
+        JiraClient.prototype,
+        "getEpicIssues",
+      ).mockImplementation(vi.fn().mockRejectedValue(new Error("Epic not found")));
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "epic-progress", epicKey: "BP-999" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Failed to get epic progress");
+      expect(getText(result)).toContain("Epic not found");
+
+      epicSpy.mockRestore();
+    });
+  });
+
+  // ── action=decompose — branches (lines 339, 373-376) ─────────────────────
+
+  describe("action=decompose", () => {
+    it("shows 'None found' when epic has no children (line 339)", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getIssueSpy = vi.spyOn(JiraClient.prototype, "getIssue").mockResolvedValue(
+        makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: ["feature"] }),
+      );
+      const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
+        issues: [],
+        total: 0,
+      });
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "decompose", epicKey: "BP-100" });
+      expect(result.isError).toBeUndefined();
+      const text = getText(result);
+      expect(text).toContain("Epic Decomposition: BP-100");
+      expect(text).toContain("Existing Stories\nNone found.");
+      expect(text).toContain("Epic desc");
+
+      getIssueSpy.mockRestore();
+      searchSpy.mockRestore();
+    });
+
+    it("shows existing children table when epic has stories (lines 331-337)", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getIssueSpy = vi.spyOn(JiraClient.prototype, "getIssue").mockResolvedValue(
+        makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: [] }),
+      );
+      const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
+        issues: [
+          {
+            key: "BP-101",
+            id: "101",
+            fields: {
+              summary: "Child story 1",
+              status: { name: "In Progress" },
+              priority: { name: "High" },
+              assignee: { displayName: "Alice" },
+            },
+          },
+          {
+            key: "BP-102",
+            id: "102",
+            fields: {
+              summary: "Child story 2",
+              status: { name: "Done" },
+              priority: { name: "Medium" },
+              assignee: undefined,
+            },
+          },
+        ],
+        total: 2,
+      });
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "decompose", epicKey: "BP-100" });
+      expect(result.isError).toBeUndefined();
+      const text = getText(result);
+      expect(text).toContain("Existing Stories (2/2)");
+      expect(text).toContain("BP-101");
+      expect(text).toContain("Child story 1");
+      expect(text).toContain("Alice");
+      expect(text).toContain("BP-102");
+      expect(text).toContain("Unassigned");
+      expect(text).not.toContain("None found");
+
+      getIssueSpy.mockRestore();
+      searchSpy.mockRestore();
+    });
+
+    it("returns error when decompose throws (line 373)", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getIssueSpy = vi
+        .spyOn(JiraClient.prototype, "getIssue")
+        .mockRejectedValue(new Error("Epic does not exist"));
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "decompose", epicKey: "BP-BAD" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Failed to decompose BP-BAD");
+      expect(getText(result)).toContain("Epic does not exist");
+
+      getIssueSpy.mockRestore();
+    });
+
+    it("returns error when epicKey is missing for decompose", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const issues = getTool("issues");
+      const result = await issues({ action: "decompose" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("epicKey is required");
+    });
+  });
+
   // rank, find-bugs, assess, triage tests moved to tools-backlog.test.ts and tools-bugs.test.ts
 });
 
@@ -1884,6 +2051,7 @@ describe("issues-helpers", () => {
       labels: "",
       updated_at: null,
       content_preview: preview,
+      source: "confluence",
     });
 
     it("formats pages as markdown list with heading and count", () => {
@@ -2117,12 +2285,12 @@ describe("issues-helpers", () => {
     });
   });
 
-  // ── buildConfluenceSection ──────────────────────────────────────────────────
+  // ── buildKbContextSection ──────────────────────────────────────────────────
 
-  describe("buildConfluenceSection", () => {
+  describe("buildKbContextSection", () => {
     it("shows no-context message when everything is empty", () => {
       const ctx = { adrs: [], designs: [], specs: [], chunks: [] };
-      const result = buildConfluenceSection(ctx);
+      const result = buildKbContextSection(ctx);
       expect(result).toContain("## Confluence Context");
       expect(result).toContain("No Confluence context found");
     });
@@ -2137,6 +2305,7 @@ describe("issues-helpers", () => {
         labels: "",
         updated_at: null,
         content_preview: "preview text",
+        source: "confluence",
       });
       const ctx = {
         adrs: [makePage("ADR-001")],
@@ -2144,7 +2313,7 @@ describe("issues-helpers", () => {
         specs: [makePage("Spec-X")],
         chunks: [],
       };
-      const result = buildConfluenceSection(ctx);
+      const result = buildKbContextSection(ctx);
       expect(result).toContain("### ADRs (1 total)");
       expect(result).toContain("### Design Docs (1 total)");
       expect(result).toContain("### Specs (1 total)");
@@ -2161,7 +2330,7 @@ describe("issues-helpers", () => {
           { page_title: "API Spec", page_type: "spec", breadcrumb: "Endpoints", snippet: "POST /tokens" },
         ],
       };
-      const result = buildConfluenceSection(ctx);
+      const result = buildKbContextSection(ctx);
       expect(result).toContain("### Targeted Matches (2 relevant sections)");
       expect(result).toContain("**Auth Guide** > OAuth Section [design]: Use PKCE flow");
       expect(result).toContain("**API Spec** > Endpoints [spec]: POST /tokens");
@@ -2176,7 +2345,7 @@ describe("issues-helpers", () => {
         snippet: `snippet ${i}`,
       }));
       const ctx = { adrs: [], designs: [], specs: [], chunks };
-      const result = buildConfluenceSection(ctx);
+      const result = buildKbContextSection(ctx);
       expect(result).toContain("### Targeted Matches (30 relevant sections)");
       expect(result).toContain("Page 24");
       expect(result).not.toContain("Page 25");

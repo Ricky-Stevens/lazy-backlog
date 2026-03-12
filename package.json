@@ -1,6 +1,6 @@
 {
   "name": "lazy-backlog",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "AI-powered Jira ticket generation grounded in Confluence knowledge.",
   "main": "dist/index.js",
   "type": "module",

@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { PageType } from "../config/schema.js";
-import { configurePragmas, initSchema, type PreparedStatements, prepareStatements } from "./db-schema.js";
+import {
+  configurePragmas,
+  initSchema,
+  migrateSchema,
+  type PreparedStatements,
+  prepareStatements,
+} from "./db-schema.js";
 import { prepareSearchVariants, type SearchStatements, searchChunks, searchPages } from "./db-search.js";
 import type {
   BacklogAnalysisRecord,
@@ -58,6 +64,7 @@ export class KnowledgeBase {
     this.db = new Database(resolvedPath);
     configurePragmas(this.db);
     initSchema(this.db);
+    migrateSchema(this.db);
     this.stmts = prepareStatements(this.db);
     this.searchStmts = prepareSearchVariants(this.db);
   }
@@ -77,6 +84,7 @@ export class KnowledgeBase {
       page.created_at,
       page.updated_at,
       page.indexed_at,
+      page.source,
     );
   }
 
@@ -118,28 +126,38 @@ export class KnowledgeBase {
   }
 
   /** Lightweight version — returns title/labels/preview, no full content. */
-  getPageSummaries(pageType: PageType, spaceKey?: string): PageSummary[] {
+  getPageSummaries(pageType: PageType, spaceKey?: string, source?: string): PageSummary[] {
+    if (source) {
+      return this.stmts.summariesBySource.all(source, pageType) as PageSummary[];
+    }
     if (spaceKey) {
       return this.stmts.summariesByTypeAndSpace.all(pageType, spaceKey) as PageSummary[];
     }
     return this.stmts.summariesByType.all(pageType) as PageSummary[];
   }
 
-  /** Get aggregate stats: total pages, breakdown by type and space. */
-  getStats(): { total: number; byType: Record<string, number>; bySpace: Record<string, number> } {
+  /** Get aggregate stats: total pages, breakdown by type, space, and source. */
+  getStats(): {
+    total: number;
+    byType: Record<string, number>;
+    bySpace: Record<string, number>;
+    bySource: Record<string, number>;
+  } {
     // Cast needed: Statement.all() returns unknown[]; row shape matches our UNION ALL query
     const rows = this.stmts.stats.all() as StatsRow[];
     let total = 0;
     const byType: Record<string, number> = {};
     const bySpace: Record<string, number> = {};
+    const bySource: Record<string, number> = {};
 
     for (const row of rows) {
       if (row.group_type === "total") total = row.count;
       else if (row.group_type === "type") byType[row.key] = row.count;
-      else bySpace[row.key] = row.count;
+      else if (row.group_type === "space") bySpace[row.key] = row.count;
+      else if (row.group_type === "source") bySource[row.key] = row.count;
     }
 
-    return { total, byType, bySpace };
+    return { total, byType, bySpace, bySource };
   }
 
   /** Read a config value from the key-value store. */
@@ -159,6 +177,13 @@ export class KnowledgeBase {
     // Cast needed: Statement.get() returns unknown; row is SELECT COUNT(*) as count
     const count = (this.stmts.countBySpaceKey.get(spaceKey) as CountRow).count;
     this.stmts.deleteBySpace.run(spaceKey);
+    return count;
+  }
+
+  /** Delete all pages from a given source. Returns the count of deleted pages. */
+  clearSource(source: string): number {
+    const count = (this.stmts.countBySource.get(source) as CountRow).count;
+    this.stmts.deleteBySource.run(source);
     return count;
   }
 
@@ -258,7 +283,7 @@ export class KnowledgeBase {
   // ── Stale/recent page queries ──
 
   /** Get pages with updated_at older than cutoff, optionally filtered. */
-  getStalePages(cutoffDate: string, opts?: { spaceKey?: string; pageType?: string }): IndexedPage[] {
+  getStalePages(cutoffDate: string, opts?: { spaceKey?: string; pageType?: string; source?: string }): IndexedPage[] {
     if (opts?.pageType && opts?.spaceKey) {
       return this.stmts.getStalePagesAll.all(cutoffDate, opts.pageType, opts.spaceKey) as IndexedPage[];
     }
@@ -271,8 +296,11 @@ export class KnowledgeBase {
     return this.stmts.getStalePages.all(cutoffDate) as IndexedPage[];
   }
 
-  /** Get pages indexed after the given timestamp. */
-  getRecentlyIndexed(since: string): IndexedPage[] {
+  /** Get pages indexed after the given timestamp, optionally filtered by source. */
+  getRecentlyIndexed(since: string, source?: string): IndexedPage[] {
+    if (source) {
+      return this.stmts.getRecentlyIndexedBySource.all(since, source) as IndexedPage[];
+    }
     return this.stmts.getRecentlyIndexed.all(since) as IndexedPage[];
   }
 

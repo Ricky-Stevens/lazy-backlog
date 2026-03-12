@@ -187,6 +187,7 @@ describe("Spider", () => {
         created_at: null,
         updated_at: "2025-01-01T00:00:00Z",
         indexed_at: new Date().toISOString(),
+        source: "confluence",
       });
 
       const client = mockClient({

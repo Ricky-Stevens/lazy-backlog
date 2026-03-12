@@ -167,8 +167,8 @@ export function extractKeywords(text: string): string[] {
   ];
 }
 
-/** Retrieve deep Confluence context for ticket planning. */
-export function retrieveConfluenceContext(kb: KnowledgeBase, description: string, spaceKey?: string) {
+/** Retrieve deep KB context for ticket planning. */
+export function retrieveKbContext(kb: KnowledgeBase, description: string, spaceKey?: string) {
   const opts = { spaceKey };
 
   const adrs = kb.getPageSummaries("adr", spaceKey);
@@ -263,8 +263,8 @@ export function buildSchemaGuidance(schema: JiraSchema | null, issueType: string
   return plan;
 }
 
-/** Build the Confluence context section for the ticket plan. */
-export function buildConfluenceSection(ctx: ReturnType<typeof retrieveConfluenceContext>): string {
+/** Build the KB context section for the ticket plan. */
+export function buildKbContextSection(ctx: ReturnType<typeof retrieveKbContext>): string {
   let plan = `## Confluence Context\n\n`;
   plan += `> **IMPORTANT:** You MUST reference relevant ADRs, design docs, and specs in ticket descriptions. Cite specific ADR numbers and technical constraints.\n\n`;
   plan += formatSummaries(ctx.adrs, "ADRs");

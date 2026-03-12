@@ -190,6 +190,17 @@ export function initSchema(db: SqliteDatabase): void {
   `);
 }
 
+/** Migrate existing DBs: add `source` column to pages if missing. */
+export function migrateSchema(db: SqliteDatabase): void {
+  const columns = db.pragma("table_info(pages)") as Array<{ name: string }>;
+  const hasSource = columns.some((c) => c.name === "source");
+  if (!hasSource) {
+    db.exec("ALTER TABLE pages ADD COLUMN source TEXT NOT NULL DEFAULT 'confluence'");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source ON pages(source)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source_key ON pages(source, space_key)");
+  }
+}
+
 /** Map of all pre-prepared CRUD statements. */
 export interface PreparedStatements {
   upsert: Statement;
@@ -198,11 +209,14 @@ export interface PreparedStatements {
   getByTypeAndSpace: Statement;
   summariesByType: Statement;
   summariesByTypeAndSpace: Statement;
+  summariesBySource: Statement;
   stats: Statement;
   getConfig: Statement;
   setConfig: Statement;
   deleteBySpace: Statement;
+  deleteBySource: Statement;
   countBySpaceKey: Statement;
+  countBySource: Statement;
   getUpdatedAt: Statement;
   insertChunk: Statement;
   deleteChunksByPage: Statement;
@@ -220,6 +234,7 @@ export interface PreparedStatements {
   getStalePagesTyped: Statement;
   getStalePagesAll: Statement;
   getRecentlyIndexed: Statement;
+  getRecentlyIndexedBySource: Statement;
   upsertTeamRule: Statement;
   getAllTeamRules: Statement;
   getTeamRulesByCategory: Statement;
@@ -234,28 +249,33 @@ export interface PreparedStatements {
 export function prepareStatements(db: SqliteDatabase): PreparedStatements {
   return {
     upsert: db.prepare(
-      `INSERT INTO pages (id, space_key, title, url, content, page_type, labels, parent_id, author_id, created_at, updated_at, indexed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO pages (id, space_key, title, url, content, page_type, labels, parent_id, author_id, created_at, updated_at, indexed_at, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          space_key=excluded.space_key, title=excluded.title, url=excluded.url,
          content=excluded.content, page_type=excluded.page_type, labels=excluded.labels,
          parent_id=excluded.parent_id, author_id=excluded.author_id,
          created_at=excluded.created_at, updated_at=excluded.updated_at,
-         indexed_at=excluded.indexed_at`,
+         indexed_at=excluded.indexed_at, source=excluded.source`,
     ),
     getById: db.prepare("SELECT * FROM pages WHERE id = ?"),
     getByType: db.prepare("SELECT * FROM pages WHERE page_type = ? ORDER BY title"),
     getByTypeAndSpace: db.prepare("SELECT * FROM pages WHERE page_type = ? AND space_key = ? ORDER BY title"),
     // Lightweight queries — no content body, just preview
     summariesByType: db.prepare(
-      `SELECT id, space_key, title, url, page_type, labels, updated_at,
+      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
        substr(content, 1, 300) as content_preview
        FROM pages WHERE page_type = ? ORDER BY title`,
     ),
     summariesByTypeAndSpace: db.prepare(
-      `SELECT id, space_key, title, url, page_type, labels, updated_at,
+      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
        substr(content, 1, 300) as content_preview
        FROM pages WHERE page_type = ? AND space_key = ? ORDER BY title`,
+    ),
+    summariesBySource: db.prepare(
+      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
+       substr(content, 1, 300) as content_preview
+       FROM pages WHERE source = ? AND page_type = ? ORDER BY title`,
     ),
     // Stats in a single query
     stats: db.prepare(`
@@ -266,6 +286,8 @@ export function prepareStatements(db: SqliteDatabase): PreparedStatements {
       UNION ALL
       SELECT 'space', space_key, COUNT(*) FROM pages GROUP BY space_key
       UNION ALL
+      SELECT 'source', source, COUNT(*) FROM pages GROUP BY source
+      UNION ALL
       SELECT 'chunks', 'all', COUNT(*) FROM chunks
     `),
     getConfig: db.prepare("SELECT value FROM config WHERE key = ?"),
@@ -273,7 +295,9 @@ export function prepareStatements(db: SqliteDatabase): PreparedStatements {
       "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ),
     deleteBySpace: db.prepare("DELETE FROM pages WHERE space_key = ?"),
+    deleteBySource: db.prepare("DELETE FROM pages WHERE source = ?"),
     countBySpaceKey: db.prepare("SELECT COUNT(*) as count FROM pages WHERE space_key = ?"),
+    countBySource: db.prepare("SELECT COUNT(*) as count FROM pages WHERE source = ?"),
     getUpdatedAt: db.prepare("SELECT id, updated_at FROM pages WHERE id = ?"),
     // Chunk statements
     insertChunk: db.prepare(
@@ -322,6 +346,9 @@ export function prepareStatements(db: SqliteDatabase): PreparedStatements {
       "SELECT * FROM pages WHERE updated_at < ? AND page_type = ? AND space_key = ? ORDER BY updated_at ASC",
     ),
     getRecentlyIndexed: db.prepare("SELECT * FROM pages WHERE indexed_at > ? ORDER BY indexed_at DESC"),
+    getRecentlyIndexedBySource: db.prepare(
+      "SELECT * FROM pages WHERE indexed_at > ? AND source = ? ORDER BY indexed_at DESC",
+    ),
     // Team rule statements
     upsertTeamRule: db.prepare(
       `INSERT INTO team_rules (category, rule_key, issue_type, rule_value, confidence, sample_size, updated_at)

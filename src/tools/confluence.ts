@@ -1,8 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { errorResponse, formatLabels, resolveConfig, textResponse } from "../lib/config.js";
+import { errorResponse, resolveConfig, textResponse } from "../lib/config.js";
 import { ConfluenceClient } from "../lib/confluence.js";
-import type { KnowledgeBase, PageSummary } from "../lib/db.js";
+import type { KnowledgeBase } from "../lib/db.js";
 import { Spider } from "../lib/indexer.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -11,47 +11,6 @@ type ToolResponse = {
   content: { type: "text"; text: string }[];
   isError?: boolean;
 };
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-const MAX_PAGE_CHARS = 15_000;
-const MAX_CONTEXT_CHARS = 20_000;
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-export function formatSummaryLine(s: PageSummary): string {
-  const preview = s.content_preview.replaceAll("\n", " ").trim();
-  return `- **${s.title}** (${s.space_key}) [${formatLabels(s.labels)}]\n  ${preview}\u2026`;
-}
-
-export function appendSection(
-  pages: PageSummary[],
-  heading: string,
-  maxItems: number,
-  budget: number,
-  emit: (s: string) => void,
-): number {
-  if (pages.length === 0 || budget <= 0) return budget;
-
-  const header = `## ${heading} (${pages.length})\n\n`;
-  emit(header);
-  budget -= header.length;
-
-  const items = pages.slice(0, maxItems);
-  for (let i = 0; i < items.length; i++) {
-    if (budget <= 100) {
-      emit(`\u2026and ${pages.length - i} more\n\n`);
-      break;
-    }
-    const p = items[i];
-    if (!p) continue;
-    const entry = `### ${p.title}\n${p.content_preview.trim()}\n\n`;
-    emit(entry);
-    budget -= entry.length;
-  }
-
-  return budget;
-}
 
 // ── Action Handlers ──────────────────────────────────────────────────────────
 
@@ -110,166 +69,6 @@ async function handleSpider(
   return textResponse(lines.join("\n"));
 }
 
-function handleStaleSearch(
-  params: { staleDays: number; spaceKey?: string; pageType?: string },
-  kb: KnowledgeBase,
-): ToolResponse {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - params.staleDays);
-  const cutoffStr = cutoff.toISOString();
-
-  const stalePages = kb.getStalePages(cutoffStr, {
-    spaceKey: params.spaceKey,
-    pageType: params.pageType,
-  });
-
-  if (stalePages.length === 0) {
-    return textResponse(`No pages older than ${params.staleDays} days found.`);
-  }
-
-  const lines = stalePages.map((p) => {
-    const daysAgo = Math.floor((Date.now() - new Date(p.updated_at ?? p.indexed_at).getTime()) / (1000 * 60 * 60 * 24));
-    return `- **${p.title}** (${p.space_key}) [${p.page_type}] \u2014 ${daysAgo}d ago`;
-  });
-
-  return textResponse(`${stalePages.length} stale pages (>${params.staleDays}d):\n\n${lines.join("\n")}`);
-}
-
-function handleSinceSearch(params: { since: string }, kb: KnowledgeBase): ToolResponse {
-  const pages = kb.getRecentlyIndexed(params.since);
-
-  if (pages.length === 0) {
-    return textResponse(`No changes since ${params.since.slice(0, 10)}.`);
-  }
-
-  const lines = pages.map((p) => {
-    return `- **${p.title}** (${p.space_key}) [${p.page_type}] indexed ${p.indexed_at.slice(0, 10)}`;
-  });
-
-  return textResponse(`${pages.length} pages changed since ${params.since.slice(0, 10)}:\n\n${lines.join("\n")}`);
-}
-
-function handleSummarize(params: { spaceKey?: string }, kb: KnowledgeBase): ToolResponse {
-  const stats = kb.getStats();
-  if (stats.total === 0) return errorResponse("Knowledge base empty. Run spider first.");
-
-  const adrs = kb.getPageSummaries("adr", params.spaceKey);
-  const designs = kb.getPageSummaries("design", params.spaceKey);
-  const specs = kb.getPageSummaries("spec", params.spaceKey);
-
-  let out = "# Project Context\n";
-  out += `${stats.total} pages | ${Object.entries(stats.byType)
-    .map(([k, v]) => `${k}:${v}`)
-    .join(" ")}\n\n`;
-
-  let budget = MAX_CONTEXT_CHARS - out.length;
-
-  budget = appendSection(adrs, "ADRs", 20, budget, (s) => {
-    out += s;
-  });
-  budget = appendSection(designs, "Design Docs", 10, budget, (s) => {
-    out += s;
-  });
-  appendSection(specs, "Specs", 10, budget, (s) => {
-    out += s;
-  });
-
-  return textResponse(out);
-}
-
-function handleFtsSearch(
-  params: { query: string; pageType?: string; spaceKey?: string; limit: number },
-  kb: KnowledgeBase,
-): ToolResponse {
-  const limit = Math.min(params.limit, 10);
-
-  const chunks = kb.searchChunks(params.query, {
-    pageType: params.pageType,
-    spaceKey: params.spaceKey,
-    limit,
-  });
-
-  if (chunks.length > 0) {
-    const lines = chunks.map((c, i) => {
-      const location = c.breadcrumb || c.heading || c.page_title;
-      const urlSuffix = c.url ? ` ${c.url}` : "";
-      return `${i + 1}. **${c.page_title}** \u203A ${location} [${c.page_type}]${urlSuffix}\n   ${c.snippet}`;
-    });
-
-    return textResponse(
-      `${chunks.length} results (section-level):\n\n${lines.join("\n\n")}` +
-        "\n\nUse **get-page** with a page ID for full content if needed.",
-    );
-  }
-
-  const results = kb.search(params.query, {
-    pageType: params.pageType,
-    spaceKey: params.spaceKey,
-    limit,
-  });
-
-  if (results.length === 0) return textResponse(`No results for "${params.query}".`);
-
-  const lines = results.map((r, i) => {
-    const urlSuffix = r.url ? ` ${r.url}` : "";
-    return `${i + 1}. **${r.title}** [${r.page_type}]${urlSuffix}\n   ${r.snippet}`;
-  });
-
-  return textResponse(`${results.length} results:\n\n${lines.join("\n\n")}`);
-}
-
-function handleSearch(
-  params: {
-    query?: string;
-    pageType?: string;
-    spaceKey?: string;
-    limit: number;
-    summarize: boolean;
-    stale: boolean;
-    staleDays: number;
-    since?: string;
-  },
-  kb: KnowledgeBase,
-): ToolResponse {
-  if (params.stale) return handleStaleSearch(params, kb);
-  if (params.since) return handleSinceSearch({ since: params.since }, kb);
-  if (params.summarize) return handleSummarize(params, kb);
-
-  if (!params.query) {
-    const stats = kb.getStats();
-    if (stats.total === 0) return textResponse("Knowledge base is empty.");
-
-    const types = Object.entries(stats.byType)
-      .map(([k, v]) => `  ${k}: ${v}`)
-      .join("\n");
-    const spaces = Object.entries(stats.bySpace)
-      .map(([k, v]) => `  ${k}: ${v}`)
-      .join("\n");
-
-    return textResponse(`Total: ${stats.total}\n\nBy type:\n${types}\n\nBy space:\n${spaces}`);
-  }
-
-  return handleFtsSearch({ query: params.query, ...params }, kb);
-}
-
-function handleGetPage(params: { pageId?: string }, kb: KnowledgeBase): ToolResponse {
-  if (!params.pageId) return errorResponse("'pageId' is required for get-page action.");
-  const page = kb.getPage(params.pageId);
-  if (!page) return errorResponse(`Page ${params.pageId} not found in knowledge base.`);
-
-  const body =
-    page.content.length > MAX_PAGE_CHARS
-      ? `${page.content.slice(0, MAX_PAGE_CHARS)}\n\n\u2026[truncated \u2014 ${page.content.length} chars total]`
-      : page.content;
-
-  return textResponse(
-    `# ${page.title}\n` +
-      `${page.page_type} | ${page.space_key} | ${formatLabels(page.labels)} | ${page.updated_at ?? "?"}\n` +
-      (page.url ? `${page.url}\n` : "") +
-      `---\n${body}`,
-  );
-}
-
 async function handleListSpaces(kb: KnowledgeBase): Promise<ToolResponse> {
   let config: ReturnType<typeof resolveConfig>;
   try {
@@ -293,30 +92,16 @@ export function registerConfluenceTool(server: McpServer, getKb: () => Knowledge
     "confluence",
     {
       description:
-        "Confluence wiki/documentation operations (NOT for Jira — use 'issues' for issue CRUD, 'bugs' for bug triage, 'backlog' for backlog management, 'sprints' for sprint ops). Use 'spider' to crawl and index Confluence pages into the local KB. Use 'search' to find indexed Confluence page content (omit query for KB stats). Use 'get-page' to retrieve a full Confluence page by ID. Use 'list-spaces' to show available Confluence spaces.",
+        "Confluence source connector. Use 'spider' to crawl and index Confluence pages into the knowledge base. Use 'list-spaces' to discover available spaces. To search or browse indexed content, use the 'knowledge' tool.",
       inputSchema: z.object({
-        action: z.enum(["spider", "search", "get-page", "list-spaces"]),
-        spaceKey: z.string().optional().describe("[spider, search] Confluence space key to target"),
+        action: z.enum(["spider", "list-spaces"]),
+        spaceKey: z.string().optional().describe("[spider] Confluence space key to target"),
         rootPageId: z.string().optional().describe("[spider] Start crawling from this page ID"),
         maxDepth: z.number().default(10).describe("[spider] Max page tree depth to crawl"),
         maxConcurrency: z.number().default(5).describe("[spider] Parallel HTTP fetches"),
         includeLabels: z.array(z.string()).default([]).describe("[spider] Only index pages with these labels"),
         excludeLabels: z.array(z.string()).default([]).describe("[spider] Skip pages with these labels"),
         force: z.boolean().default(false).describe("[spider] Drop and rebuild the full-text index before crawling"),
-        query: z.string().optional().describe("[search] Search query. Omit to get KB stats overview"),
-        pageType: z
-          .enum(["adr", "design", "runbook", "meeting", "spec", "other"])
-          .optional()
-          .describe("[search] Filter results by page type"),
-        limit: z.number().default(5).describe("[search] Max results to return"),
-        summarize: z
-          .boolean()
-          .default(false)
-          .describe("[search] Return a context summary (ADRs, designs, specs) instead of raw search results"),
-        stale: z.boolean().default(false).describe("[search] Find stale/outdated pages instead of searching"),
-        staleDays: z.number().default(90).describe("[search] Pages not updated in this many days are considered stale"),
-        since: z.string().optional().describe("[search] ISO date — only show pages changed after this date"),
-        pageId: z.string().optional().describe("[get-page] Page ID to retrieve"),
       }),
     },
     async (params) => {
@@ -325,10 +110,6 @@ export function registerConfluenceTool(server: McpServer, getKb: () => Knowledge
       switch (params.action) {
         case "spider":
           return handleSpider(params, kb);
-        case "search":
-          return handleSearch(params, kb);
-        case "get-page":
-          return handleGetPage(params, kb);
         case "list-spaces":
           return handleListSpaces(kb);
         default: {
