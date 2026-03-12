@@ -418,7 +418,7 @@ describe("action=setup", () => {
     expect(text).toContain("Backlog (BP)");
     expect(text).toContain("issue types");
     expect(text).toContain("Team Conventions");
-    expect(text).toContain("1 rules extracted");
+    expect(text).toContain("1 rules + 1 insights extracted");
     expect(mockAnalyzeBacklog).toHaveBeenCalledOnce();
   });
 

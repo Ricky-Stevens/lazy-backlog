@@ -181,7 +181,14 @@ describe("registerKnowledgeTool", () => {
       const { server, getTool } = createMockServer();
       registerKnowledgeTool(server, () => kb);
 
-      kb.upsertPage(makePage({ id: "p1", title: "Auth Design", url: "https://wiki.example.com/page-1", content: "OAuth2 authentication flow" }));
+      kb.upsertPage(
+        makePage({
+          id: "p1",
+          title: "Auth Design",
+          url: "https://wiki.example.com/page-1",
+          content: "OAuth2 authentication flow",
+        }),
+      );
       kb.upsertChunks("p1", [
         {
           breadcrumb: "Auth > OAuth2",
@@ -428,7 +435,9 @@ describe("registerKnowledgeTool", () => {
       const { server, getTool } = createMockServer();
       registerKnowledgeTool(server, () => kb);
 
-      kb.upsertPage(makePage({ id: "p1", title: "With URL", url: "https://wiki.example.com/page-1", content: "content" }));
+      kb.upsertPage(
+        makePage({ id: "p1", title: "With URL", url: "https://wiki.example.com/page-1", content: "content" }),
+      );
 
       const tool = getTool("knowledge");
       const result = await tool({
@@ -455,7 +464,7 @@ describe("registerKnowledgeTool", () => {
       expect(text).toContain("No URL Page");
       // The URL line should not appear between the metadata and the ---
       const lines = text.split("\n");
-      const dashIdx = lines.findIndex((l) => l === "---");
+      const dashIdx = lines.indexOf("---");
       // Line before --- should be the metadata line, not a URL
       expect(lines[dashIdx - 1]).not.toMatch(/^https?:\/\//);
     });

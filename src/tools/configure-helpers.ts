@@ -1,5 +1,6 @@
 import type { KnowledgeBase } from "../lib/db.js";
 import type { JiraClient } from "../lib/jira.js";
+import { analyzeTeamInsights } from "../lib/team-insights.js";
 import type { TicketData } from "../lib/team-rules.js";
 
 type AnalyzeBacklogFn = (
@@ -70,30 +71,18 @@ async function fetchTickets(
   resolvedProjectKey: string,
   maxTickets: number,
   adfToText: AdfToTextFn,
+  boardId?: string,
 ): Promise<TicketData[]> {
-  const jql = `project = ${resolvedProjectKey} AND status in (Done, Closed, Resolved) ORDER BY updated DESC`;
+  const jql = `status in (Done, Closed, Resolved) ORDER BY updated DESC`;
   const spField = jira.storyPointsFieldId;
-  const extendedFields = [
-    "summary",
-    "description",
-    "status",
-    "issuetype",
-    "priority",
-    "assignee",
-    "labels",
-    "components",
-    "created",
-    "updated",
-    "resolutiondate",
-    "fixVersions",
-    ...(spField ? [spField] : ["customfield_10016"]),
-  ];
   const allTickets: TicketData[] = [];
   let startAt = 0;
   const pageSize = Math.min(50, maxTickets);
 
   while (allTickets.length < maxTickets) {
-    const batch = await jira.searchIssues(jql, extendedFields, pageSize, startAt);
+    const batch = boardId
+      ? await jira.searchBoardIssues(boardId, jql, pageSize, startAt)
+      : await jira.searchIssues(`project = ${resolvedProjectKey} AND ${jql}`, undefined, pageSize, startAt);
     if (batch.issues.length === 0) break;
 
     for (const issue of batch.issues) {
@@ -137,6 +126,52 @@ async function enrichChangelogs(allTickets: TicketData[], jira: JiraClient): Pro
   }
 }
 
+// ── Insight Storage ─────────────────────────────────────────────────────────
+
+function buildInsightRecords(
+  allTickets: TicketData[],
+): Array<{ category: string; key: string; data: unknown; sampleSize: number; confidence: number }> {
+  const insights = analyzeTeamInsights(allTickets);
+  const records: Array<{ category: string; key: string; data: unknown; sampleSize: number; confidence: number }> = [];
+
+  for (const est of insights.estimation) {
+    records.push({
+      category: "estimation",
+      key: est.issueType,
+      data: est,
+      sampleSize: est.sampleSize,
+      confidence: est.sampleSize >= 10 ? 0.8 : 0.5,
+    });
+  }
+  for (const own of insights.ownership) {
+    records.push({
+      category: "ownership",
+      key: own.component,
+      data: own,
+      sampleSize: own.sampleSize,
+      confidence: own.sampleSize >= 10 ? 0.8 : 0.5,
+    });
+  }
+  for (const tmpl of insights.templates) {
+    records.push({
+      category: "templates",
+      key: tmpl.issueType,
+      data: tmpl,
+      sampleSize: tmpl.sampleSize,
+      confidence: tmpl.sampleSize >= 10 ? 0.8 : 0.5,
+    });
+  }
+  records.push({
+    category: "patterns",
+    key: "global",
+    data: insights.patterns,
+    sampleSize: allTickets.length,
+    confidence: allTickets.length >= 20 ? 0.8 : 0.5,
+  });
+
+  return records;
+}
+
 // ── Learn Team Conventions ───────────────────────────────────────────────────
 
 export async function learnTeamConventions(
@@ -145,9 +180,10 @@ export async function learnTeamConventions(
   resolvedProjectKey: string,
   maxTickets = 200,
   qualityThreshold = 60,
+  boardId?: string,
 ): Promise<string> {
   const { jira, analyzeBacklog, adfToText } = deps;
-  const allTickets = await fetchTickets(jira, resolvedProjectKey, maxTickets, adfToText);
+  const allTickets = await fetchTickets(jira, resolvedProjectKey, maxTickets, adfToText, boardId);
 
   if (allTickets.length === 0) return "## Team Conventions\nNo completed tickets found — skipped.\n";
 
@@ -166,6 +202,10 @@ export async function learnTeamConventions(
     })),
   );
 
+  // Extract and store team insights (estimation, ownership, templates, patterns)
+  const insightRecords = buildInsightRecords(allTickets);
+  kb.upsertInsights(insightRecords);
+
   const jql = `project = ${resolvedProjectKey} AND status in (Done, Closed, Resolved) ORDER BY updated DESC`;
   kb.recordAnalysis({
     project_key: resolvedProjectKey,
@@ -179,7 +219,7 @@ export async function learnTeamConventions(
 
   return (
     "## Team Conventions\n" +
-    `Analyzed ${result.totalTickets} tickets → ${result.rules.length} rules extracted\n` +
+    `Analyzed ${result.totalTickets} tickets → ${result.rules.length} rules + ${insightRecords.length} insights extracted\n` +
     `Quality: ${result.qualityPassed}/${result.totalTickets} passed (avg score: ${result.avgQualityScore.toFixed(1)}/100)\n`
   );
 }

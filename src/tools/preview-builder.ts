@@ -19,6 +19,7 @@ export interface PreviewData {
   duplicates: DuplicateCandidate[];
   schemaGuidance?: string;
   fieldRules?: string;
+  insights?: string;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
@@ -92,6 +93,11 @@ export function buildPreviewCard(data: PreviewData): string {
     sections.push(conventionsText);
   }
 
+  // Team insights
+  if (data.insights) {
+    sections.push(data.insights);
+  }
+
   // KB context
   if (data.kbContext) {
     sections.push(`## Knowledge Base Context\n\n${data.kbContext}`);
@@ -152,6 +158,12 @@ export function buildBulkPreviewCard(tickets: PreviewData[]): string {
     if (conventionsText) {
       sections.push(conventionsText);
     }
+  }
+
+  // Shared insights (from first ticket that has them)
+  const firstWithInsights = tickets.find((t) => t.insights);
+  if (firstWithInsights?.insights) {
+    sections.push(firstWithInsights.insights);
   }
 
   // Shared KB context (from first ticket that has it)

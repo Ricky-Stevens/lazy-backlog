@@ -8,6 +8,7 @@ import { registerBacklogTool } from "./tools/backlog.js";
 import { registerBugsTool } from "./tools/bugs.js";
 import { registerConfigureTool } from "./tools/configure.js";
 import { registerConfluenceTool } from "./tools/confluence.js";
+import { registerInsightsTool } from "./tools/insights.js";
 import { registerIssuesTool } from "./tools/issues.js";
 import { registerKnowledgeTool } from "./tools/knowledge.js";
 import { registerSprintsTool } from "./tools/sprints.js";
@@ -22,10 +23,11 @@ function getKb(): KnowledgeBase {
   return kb;
 }
 
-// Register consolidated tools (7 tools with action-based routing)
+// Register consolidated tools (8 tools with action-based routing)
 registerConfigureTool(server, getKb);
 registerConfluenceTool(server, getKb);
 registerKnowledgeTool(server, getKb);
+registerInsightsTool(server, getKb);
 registerBacklogTool(server, getKb);
 registerBugsTool(server, getKb);
 registerIssuesTool(server, getKb);

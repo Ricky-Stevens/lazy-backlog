@@ -383,6 +383,71 @@ export class KnowledgeBase {
     );
   }
 
+  // ── Team insights methods ──
+
+  /** Insert or update a single team insight. */
+  upsertInsight(category: string, key: string, data: unknown, sampleSize: number, confidence: number): void {
+    this.stmts.upsertInsight.run(category, key, JSON.stringify(data), sampleSize, confidence);
+  }
+
+  /** Batch upsert team insights in a single transaction. */
+  upsertInsights(
+    insights: Array<{ category: string; key: string; data: unknown; sampleSize: number; confidence: number }>,
+  ): void {
+    this.db.transaction(() => {
+      for (const i of insights) {
+        this.upsertInsight(i.category, i.key, i.data, i.sampleSize, i.confidence);
+      }
+    })();
+  }
+
+  /** Get all insights for a category. */
+  getInsights(category: string): Array<{
+    category: string;
+    insight_key: string;
+    data: string;
+    sample_size: number;
+    confidence: number;
+    updated_at: string;
+  }> {
+    return this.stmts.getInsightsByCategory.all(category) as Array<{
+      category: string;
+      insight_key: string;
+      data: string;
+      sample_size: number;
+      confidence: number;
+      updated_at: string;
+    }>;
+  }
+
+  /** Get all team insights across all categories. */
+  getAllInsights(): Array<{
+    category: string;
+    insight_key: string;
+    data: string;
+    sample_size: number;
+    confidence: number;
+    updated_at: string;
+  }> {
+    return this.stmts.getAllInsights.all() as Array<{
+      category: string;
+      insight_key: string;
+      data: string;
+      sample_size: number;
+      confidence: number;
+      updated_at: string;
+    }>;
+  }
+
+  /** Clear insights, optionally filtered by category. */
+  clearInsights(category?: string): void {
+    if (category) {
+      this.stmts.deleteInsightsByCategory.run(category);
+    } else {
+      this.stmts.deleteAllInsights.run();
+    }
+  }
+
   rebuildFts(): void {
     this.db.transaction(() => {
       this.db.exec("DELETE FROM pages_fts");

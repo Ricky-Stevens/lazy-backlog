@@ -29,9 +29,9 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
     "issues",
     {
       description:
-        "Jira issue CRUD and planning. IMPORTANT: 'create' and 'bulk-create' ALWAYS return a preview first. You MUST show the preview to the user and wait for their explicit approval before calling again with confirmed=true. NEVER set confirmed=true without user approval. Actions: 'get' fetch one or many issue details (pass issueKey for single, issueKeys for bulk). 'create' create one issue (returns preview — user must approve before confirmed=true). 'bulk-create' create multiple (returns preview — user must approve before confirmed=true). 'update' modify fields, transition status, assign, or link. 'search' query via JQL (auto-scoped to configured board). 'epic-progress' show epic completion stats. 'decompose' break an epic into child stories. For bug-specific workflows (find, assess, triage) use the 'bugs' tool. For backlog listing and ranking use the 'backlog' tool. For sprint operations use the 'sprints' tool.",
+        "Jira issue CRUD and planning. IMPORTANT: 'create' and 'bulk-create' ALWAYS return a preview first. You MUST show the preview to the user and wait for their explicit approval before calling again with confirmed=true. NEVER set confirmed=true without user approval. Actions: 'get' fetch one or many issue details (pass issueKey for single, issueKeys for bulk). 'create' create one issue (returns preview — user must approve before confirmed=true). 'bulk-create' create multiple (returns preview — user must approve before confirmed=true). 'update' modify fields, transition status, assign, or link. 'search' query via JQL (auto-scoped to configured board). 'decompose' break an epic into child stories. For epic progress, velocity, retros, and team profile use the 'insights' tool. For bug-specific workflows (find, assess, triage) use the 'bugs' tool. For backlog listing and ranking use the 'backlog' tool. For sprint operations use the 'sprints' tool.",
       inputSchema: z.object({
-        action: z.enum(["get", "create", "bulk-create", "update", "search", "epic-progress", "decompose"]),
+        action: z.enum(["get", "create", "bulk-create", "update", "search", "decompose"]),
         // Shared identifiers
         issueKey: z.string().optional().describe("[get, update] Single issue key, e.g. 'BP-42'"),
         issueKeys: z
@@ -93,8 +93,8 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
         // ranking
         rankBefore: z.string().optional().describe("[update] Rank this issue before the specified issue key"),
         rankAfter: z.string().optional().describe("[update] Rank this issue after the specified issue key"),
-        // epic-progress / decompose
-        epicKey: z.string().optional().describe("[epic-progress, decompose] Epic issue key"),
+        // decompose
+        epicKey: z.string().optional().describe("[decompose] Epic issue key"),
         // update extras
         status: z.string().optional().describe("[update] Transition to this status name, e.g. 'In Progress', 'Done'"),
         assignee: z.string().optional().describe("[update] Assignee account ID, or 'unassigned' to clear"),
@@ -236,66 +236,6 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
       // ── SEARCH ──
       if (params.action === "search") {
         return handleSearchAction(params, kb);
-      }
-
-      // ── EPIC-PROGRESS ──
-      if (params.action === "epic-progress") {
-        if (!params.epicKey) return errorResponse("epicKey is required for 'epic-progress' action.");
-        try {
-          const { jira } = buildJiraClient(kb);
-          const issues = await jira.getEpicIssues(params.epicKey);
-          const spField = jira.storyPointsFieldId;
-
-          let doneCount = 0;
-          let inProgressCount = 0;
-          let todoCount = 0;
-          let totalPoints = 0;
-          let completedPoints = 0;
-          const remaining: Array<{ key: string; summary: string; status: string }> = [];
-
-          for (const issue of issues) {
-            const f = issue.fields as Record<string, unknown>;
-            const statusName = issue.fields.status?.name ?? "Unknown";
-            const cat = (issue.fields.status?.statusCategory?.name ?? "new").toLowerCase();
-            const sp =
-              (spField ? (f[spField] as number | undefined) : undefined) ??
-              (f.story_points as number | undefined) ??
-              (f.customfield_10016 as number | undefined) ??
-              0;
-
-            if (cat === "done") {
-              doneCount++;
-              completedPoints += sp;
-            } else if (cat === "indeterminate" || cat === "in progress") {
-              inProgressCount++;
-              remaining.push({ key: issue.key, summary: issue.fields.summary, status: statusName });
-            } else {
-              todoCount++;
-              remaining.push({ key: issue.key, summary: issue.fields.summary, status: statusName });
-            }
-            totalPoints += sp;
-          }
-
-          const total = issues.length;
-          const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
-          const remainingPoints = totalPoints - completedPoints;
-
-          let out = `# Epic Progress: ${params.epicKey}\n\n`;
-          out += `**Total Issues:** ${total} | **Done:** ${doneCount} | **In Progress:** ${inProgressCount} | **To Do:** ${todoCount}\n`;
-          out += `**Story Points:** ${totalPoints} total, ${completedPoints} completed, ${remainingPoints} remaining\n`;
-          out += `**Completion:** ${pct}%\n`;
-
-          if (remaining.length > 0) {
-            out += `\n## Remaining Issues (${remaining.length})\n`;
-            for (const r of remaining) {
-              out += `- ${r.key} (${r.status}): ${r.summary}\n`;
-            }
-          }
-
-          return textResponse(out);
-        } catch (err: unknown) {
-          return errorResponse(`Failed to get epic progress: ${err instanceof Error ? err.message : String(err)}`);
-        }
       }
 
       // ── DECOMPOSE ──

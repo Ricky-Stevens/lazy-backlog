@@ -2,9 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import { groupBy, type KnowledgeBase } from "../lib/db.js";
-import { handleHealthAction, handleVelocityAction } from "./sprints-analytics.js";
+import { handleHealthAction } from "./sprints-analytics.js";
 import { handleCreateSprintAction, handleGoalAction, handleMoveIssuesAction } from "./sprints-mutations.js";
-import { handleRetroAction } from "./sprints-retro.js";
 import { getStoryPoints } from "./sprints-utils.js";
 
 // ── Barrel re-exports ─────────────────────────────────────────────────────────
@@ -21,11 +20,11 @@ export function registerSprintsTool(server: McpServer, getKb: () => KnowledgeBas
     "sprints",
     {
       description:
-        "Jira sprint management and analytics. Use this tool for ALL sprint-related queries (active sprint, sprint issues, velocity, etc). Actions: 'list' show sprints (use state='active' for current sprint). 'get' sprint details with full issue breakdown. 'create' a new sprint. 'move-issues' assign issues to a sprint. 'velocity' team velocity trends across past sprints. 'health' active sprint progress, stale items, capacity. 'retro' retrospective data (scope creep, time-in-status). 'goal' read or set sprint goal. To get/update individual issues use the 'issues' tool. For bug workflows use the 'bugs' tool. For backlog management use the 'backlog' tool.",
+        "Jira sprint management. Use this tool for sprint CRUD and health checks. Actions: 'list' show sprints (use state='active' for current sprint). 'get' sprint details with full issue breakdown. 'create' a new sprint. 'move-issues' assign issues to a sprint. 'health' active sprint progress, stale items, capacity. 'goal' read or set sprint goal. For velocity, retros, epic progress, and team intelligence use the 'insights' tool. For individual issues use 'issues'. For bug workflows use 'bugs'. For backlog use 'backlog'.",
       inputSchema: z.object({
-        action: z.enum(["list", "get", "create", "move-issues", "velocity", "health", "retro", "goal"]),
+        action: z.enum(["list", "get", "create", "move-issues", "health", "goal"]),
         state: z.enum(["active", "future", "closed"]).optional().describe("[list] Filter sprints by state"),
-        sprintId: z.string().optional().describe("[get, move-issues, health, retro, goal] Sprint ID to operate on"),
+        sprintId: z.string().optional().describe("[get, move-issues, health, goal] Sprint ID to operate on"),
         name: z.string().optional().describe("[create] Name for the new sprint"),
         goal: z
           .string()
@@ -37,15 +36,6 @@ export function registerSprintsTool(server: McpServer, getKb: () => KnowledgeBas
           .array(z.string())
           .optional()
           .describe("[move-issues] Issue keys to move into the sprint, e.g. ['BP-1','BP-2']"),
-        sprintCount: z
-          .number()
-          .default(5)
-          .optional()
-          .describe("[velocity] Number of past closed sprints to include in velocity analysis"),
-        trendMetrics: z
-          .array(z.enum(["velocity", "bugRate", "scopeChange"]))
-          .optional()
-          .describe("[velocity] Metrics to compute: velocity (story points), bugRate, scopeChange"),
         staleDays: z
           .number()
           .default(3)
@@ -158,17 +148,9 @@ export function registerSprintsTool(server: McpServer, getKb: () => KnowledgeBas
           case "move-issues":
             return handleMoveIssuesAction(params, jira);
 
-          // ── Velocity ──
-          case "velocity":
-            return handleVelocityAction(params, jira, boardId ?? "");
-
           // ── Sprint health (with capacity) ──
           case "health":
             return handleHealthAction(params, jira, boardId ?? "", spFieldId);
-
-          // ── Retro ──
-          case "retro":
-            return handleRetroAction(params, jira, boardId ?? "", spFieldId);
 
           // ── Goal ──
           case "goal":

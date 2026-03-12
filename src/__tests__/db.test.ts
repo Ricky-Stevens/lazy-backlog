@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CachedChangelogEntry, CachedSprint, IndexedPage } from "../lib/db.js";
-import { KnowledgeBase, ftsQuery, sanitizeFtsQuery } from "../lib/db.js";
+import { ftsQuery, KnowledgeBase, sanitizeFtsQuery } from "../lib/db.js";
 
 /** Create a minimal IndexedPage for testing. */
 function makePage(overrides: Partial<IndexedPage> = {}): IndexedPage {

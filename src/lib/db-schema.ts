@@ -188,6 +188,19 @@ export function initSchema(db: SqliteDatabase): void {
       analyzed_at TEXT NOT NULL
     ) STRICT
   `);
+
+  // ── Team insights ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS team_insights (
+      category TEXT NOT NULL,
+      insight_key TEXT NOT NULL,
+      data TEXT NOT NULL,
+      sample_size INTEGER NOT NULL DEFAULT 0,
+      confidence REAL NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (category, insight_key)
+    ) STRICT
+  `);
 }
 
 /** Migrate existing DBs: add `source` column to pages if missing. */
@@ -243,6 +256,11 @@ export interface PreparedStatements {
   deleteAllTeamRules: Statement;
   insertAnalysis: Statement;
   getLatestAnalysis: Statement;
+  upsertInsight: Statement;
+  getInsightsByCategory: Statement;
+  getAllInsights: Statement;
+  deleteInsightsByCategory: Statement;
+  deleteAllInsights: Statement;
 }
 
 /** Pre-prepare all CRUD statements to avoid dynamic SQL. */
@@ -372,5 +390,14 @@ export function prepareStatements(db: SqliteDatabase): PreparedStatements {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ),
     getLatestAnalysis: db.prepare("SELECT * FROM backlog_analysis ORDER BY analyzed_at DESC LIMIT 1"),
+    // Team insight statements
+    upsertInsight: db.prepare(
+      `INSERT OR REPLACE INTO team_insights (category, insight_key, data, sample_size, confidence, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+    ),
+    getInsightsByCategory: db.prepare("SELECT * FROM team_insights WHERE category = ?"),
+    getAllInsights: db.prepare("SELECT * FROM team_insights"),
+    deleteInsightsByCategory: db.prepare("DELETE FROM team_insights WHERE category = ?"),
+    deleteAllInsights: db.prepare("DELETE FROM team_insights"),
   };
 }

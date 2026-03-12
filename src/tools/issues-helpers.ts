@@ -1,5 +1,11 @@
 import type { KnowledgeBase, PageSummary } from "../lib/db.js";
 import type { JiraSchema } from "../lib/jira.js";
+import type {
+  EstimationInsight,
+  OwnershipInsight,
+  PatternInsight,
+  TemplateInsight,
+} from "../lib/team-insights-types.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -261,6 +267,19 @@ export function buildSchemaGuidance(schema: JiraSchema | null, issueType: string
   if (schema.sampleTickets?.length) plan += formatSampleTickets(schema.sampleTickets);
 
   return plan;
+}
+
+/** Load parsed team insights from the knowledge base. */
+export function loadTeamInsights(kb: KnowledgeBase) {
+  const estimation = kb.getInsights("estimation").map((r) => JSON.parse(r.data) as EstimationInsight);
+  const ownership = kb.getInsights("ownership").map((r) => JSON.parse(r.data) as OwnershipInsight);
+  const templates = kb.getInsights("templates").map((r) => JSON.parse(r.data) as TemplateInsight);
+  const patternsRaw = kb.getInsights("patterns");
+  const patterns: PatternInsight =
+    patternsRaw.length > 0
+      ? (JSON.parse(patternsRaw[0]?.data ?? "{}") as PatternInsight)
+      : { priorityDistribution: {}, labelCooccurrence: [], reworkRates: [] };
+  return { estimation, ownership, templates, patterns };
 }
 
 /** Build the KB context section for the ticket plan. */

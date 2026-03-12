@@ -140,12 +140,17 @@ function handleGet(kb: KnowledgeBase): ToolResponse {
   const schema = JiraClient.loadSchemaFromDb(kb);
   const stats = kb.getStats();
   const teamRules = kb.getTeamRules();
+  const allInsights = kb.getAllInsights();
 
   const schemaStatus = schema
     ? `Discovered (${schema.issueTypes.length} types)`
     : "Not run — use configure action='setup'";
   const kbStatus = stats.total > 0 ? `${stats.total} pages indexed` : "Empty";
   const rulesStatus = teamRules.length > 0 ? `${teamRules.length} rules learned` : "Not analyzed";
+  const insightsStatus =
+    allInsights.length > 0
+      ? `${allInsights.length} insights stored — use insights action='team-profile' to view`
+      : "Not analyzed";
 
   lines.push(
     "",
@@ -153,6 +158,7 @@ function handleGet(kb: KnowledgeBase): ToolResponse {
     `**Jira Schema:** ${schemaStatus}`,
     `**Confluence KB:** ${kbStatus}`,
     `**Team Conventions:** ${rulesStatus}`,
+    `**Team Intelligence:** ${insightsStatus}`,
   );
 
   return textResponse(lines.join("\n"));
@@ -282,6 +288,7 @@ async function handleSetup(
         resolvedProjectKey,
         params.maxTickets,
         params.qualityThreshold,
+        boardId,
       ),
     );
   } catch (err: unknown) {
@@ -299,7 +306,7 @@ export function registerConfigureTool(server: McpServer, getKb: () => KnowledgeB
     "configure",
     {
       description:
-        "Project configuration. Actions: 'setup' — REQUIRED before using any other tool. Needs projectKey, boardId, and spaceKeys (Confluence). If any are missing, ask the user for ALL THREE before calling. Discovers Jira schema, spiders Confluence pages for context, and learns team conventions from existing tickets. 'set' — save individual settings. 'get' — view current config and setup status. After setup, use 'issues' for issue CRUD, 'bugs' for bug workflows, 'backlog' for backlog management, 'sprints' for sprint ops, 'confluence' for wiki search.",
+        "Project configuration. Actions: 'setup' — REQUIRED before using any other tool. Needs projectKey, boardId, and spaceKeys (Confluence). If any are missing, ask the user for ALL THREE before calling. Discovers Jira schema, spiders Confluence pages for context, and learns team conventions from existing tickets. 'set' — save individual settings. 'get' — view current config and setup status. After setup, use 'issues' for issue CRUD, 'bugs' for bug workflows, 'backlog' for backlog management, 'sprints' for sprint ops, 'insights' for team intelligence + velocity + retros + epic progress, 'knowledge' for KB search, 'confluence' for wiki crawling.",
       inputSchema: z.object({
         action: z.enum(["setup", "set", "get"]),
         jiraProjectKey: z.string().optional().describe("[set] Jira project key, e.g. 'BP'"),

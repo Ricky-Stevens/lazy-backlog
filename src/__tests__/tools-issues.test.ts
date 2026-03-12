@@ -1417,87 +1417,6 @@ describe("registerIssuesTool", () => {
     });
   });
 
-  describe("action=epic-progress", () => {
-    it("computes progress with mixed statuses", async () => {
-      const { server, getTool } = createMockServer();
-      registerIssuesTool(server, () => kb);
-      JiraClient.saveSchemaToDb(kb, testSchema);
-
-      const epicIssuesSpy = vi.fn().mockResolvedValue([
-        {
-          key: "BP-10",
-          id: "10",
-          fields: {
-            summary: "Done task",
-            status: { name: "Done", statusCategory: { name: "Done" } },
-            customfield_10016: 3,
-          },
-        },
-        {
-          key: "BP-11",
-          id: "11",
-          fields: {
-            summary: "In progress task",
-            status: { name: "In Progress", statusCategory: { name: "indeterminate" } },
-            customfield_10016: 5,
-          },
-        },
-        {
-          key: "BP-12",
-          id: "12",
-          fields: {
-            summary: "Todo task",
-            status: { name: "To Do", statusCategory: { name: "new" } },
-            customfield_10016: 2,
-          },
-        },
-        {
-          key: "BP-13",
-          id: "13",
-          fields: {
-            summary: "Another done",
-            status: { name: "Done", statusCategory: { name: "Done" } },
-            customfield_10016: 1,
-          },
-        },
-      ]);
-      (vi.spyOn as (...args: unknown[]) => ReturnType<typeof vi.spyOn>)(
-        JiraClient.prototype,
-        "getEpicIssues",
-      ).mockImplementation(epicIssuesSpy);
-
-      const issues = getTool("issues");
-      const result = await issues({ action: "epic-progress", epicKey: "BP-100" });
-      expect(result.isError).toBeUndefined();
-      const text = getText(result);
-      expect(text).toContain("Epic Progress: BP-100");
-      expect(text).toContain("**Total Issues:** 4");
-      expect(text).toContain("**Done:** 2");
-      expect(text).toContain("**In Progress:** 1");
-      expect(text).toContain("**To Do:** 1");
-      expect(text).toContain("11 total, 4 completed, 7 remaining");
-      expect(text).toContain("**Completion:** 50%");
-      expect(text).toContain("Remaining Issues (2)");
-      expect(text).toContain("BP-11");
-      expect(text).toContain("BP-12");
-      // BP-10 is done, should not appear in remaining list (but BP-100 is the epic key in header)
-      expect(text).not.toMatch(/- BP-10 \(/);
-
-      vi.restoreAllMocks();
-    });
-
-    it("returns error when epicKey missing", async () => {
-      const { server, getTool } = createMockServer();
-      registerIssuesTool(server, () => kb);
-      JiraClient.saveSchemaToDb(kb, testSchema);
-
-      const issues = getTool("issues");
-      const result = await issues({ action: "epic-progress" });
-      expect(result.isError).toBe(true);
-      expect(getText(result)).toContain("epicKey is required");
-    });
-  });
-
   // ── handleGetAction — additional branch coverage ───────────────────────────
 
   describe("action=get (dev-status + comment branches)", () => {
@@ -1769,9 +1688,7 @@ describe("registerIssuesTool", () => {
       registerIssuesTool(server, () => kb);
       JiraClient.saveSchemaToDb(kb, testSchema);
 
-      const updateSpy = vi
-        .spyOn(JiraClient.prototype, "updateIssue")
-        .mockRejectedValue(new Error("Permission denied"));
+      const updateSpy = vi.spyOn(JiraClient.prototype, "updateIssue").mockRejectedValue(new Error("Permission denied"));
 
       const issues = getTool("issues");
       const result = await issues({ action: "update", issueKey: "BP-1", summary: "Try update" });
@@ -1794,29 +1711,6 @@ describe("registerIssuesTool", () => {
     });
   });
 
-  // ── action=epic-progress — error catch branch (line 297) ──────────────────
-
-  describe("action=epic-progress (error branch)", () => {
-    it("returns error when getEpicIssues throws", async () => {
-      const { server, getTool } = createMockServer();
-      registerIssuesTool(server, () => kb);
-      JiraClient.saveSchemaToDb(kb, testSchema);
-
-      const epicSpy = (vi.spyOn as (...args: unknown[]) => ReturnType<typeof vi.spyOn>)(
-        JiraClient.prototype,
-        "getEpicIssues",
-      ).mockImplementation(vi.fn().mockRejectedValue(new Error("Epic not found")));
-
-      const issues = getTool("issues");
-      const result = await issues({ action: "epic-progress", epicKey: "BP-999" });
-      expect(result.isError).toBe(true);
-      expect(getText(result)).toContain("Failed to get epic progress");
-      expect(getText(result)).toContain("Epic not found");
-
-      epicSpy.mockRestore();
-    });
-  });
-
   // ── action=decompose — branches (lines 339, 373-376) ─────────────────────
 
   describe("action=decompose", () => {
@@ -1825,9 +1719,11 @@ describe("registerIssuesTool", () => {
       registerIssuesTool(server, () => kb);
       JiraClient.saveSchemaToDb(kb, testSchema);
 
-      const getIssueSpy = vi.spyOn(JiraClient.prototype, "getIssue").mockResolvedValue(
-        makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: ["feature"] }),
-      );
+      const getIssueSpy = vi
+        .spyOn(JiraClient.prototype, "getIssue")
+        .mockResolvedValue(
+          makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: ["feature"] }),
+        );
       const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
         issues: [],
         total: 0,
@@ -1850,9 +1746,11 @@ describe("registerIssuesTool", () => {
       registerIssuesTool(server, () => kb);
       JiraClient.saveSchemaToDb(kb, testSchema);
 
-      const getIssueSpy = vi.spyOn(JiraClient.prototype, "getIssue").mockResolvedValue(
-        makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: [] }),
-      );
+      const getIssueSpy = vi
+        .spyOn(JiraClient.prototype, "getIssue")
+        .mockResolvedValue(
+          makeIssueDetail("BP-100", { summary: "Epic summary", description: "Epic desc", labels: [] }),
+        );
       const searchSpy = vi.spyOn(JiraClient.prototype, "searchIssues").mockResolvedValue({
         issues: [
           {

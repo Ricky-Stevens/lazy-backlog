@@ -2,9 +2,21 @@ import { buildJiraClient, errorResponse, resolveConfig, textResponse } from "../
 import type { KnowledgeBase } from "../lib/db.js";
 import { findDuplicates } from "../lib/duplicate-detect.js";
 import { JiraClient, type JiraTicketInput } from "../lib/jira.js";
+import type { TicketContext } from "../lib/team-insights-suggest.js";
+import {
+  formatInsightsSection,
+  generateDescriptionScaffold,
+  generateSmartDefaults,
+} from "../lib/team-insights-suggest.js";
 import { DEFAULT_RULES, mergeWithDefaults } from "../lib/team-rules.js";
 import { evaluateConventions } from "../lib/team-rules-format.js";
-import { buildKbContextSection, buildSchemaGuidance, FIELD_RULES, retrieveKbContext } from "./issues-helpers.js";
+import {
+  buildKbContextSection,
+  buildSchemaGuidance,
+  FIELD_RULES,
+  loadTeamInsights,
+  retrieveKbContext,
+} from "./issues-helpers.js";
 import { buildBulkPreviewCard, buildPreviewCard, type PreviewData } from "./preview-builder.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -126,6 +138,32 @@ export async function handleCreateAction(
 
     const kbContextText = buildKbContextSection(ctx);
 
+    // Team insights — smart defaults and description scaffolding
+    const teamInsights = loadTeamInsights(kb);
+    const ticketCtx: TicketContext = {
+      summary: params.summary,
+      issueType,
+      description: params.description,
+      components: params.components,
+      labels: params.labels,
+      storyPoints: params.storyPoints,
+      priority: params.priority,
+    };
+    const smartDefaults = generateSmartDefaults(
+      ticketCtx,
+      teamInsights.estimation,
+      teamInsights.ownership,
+      teamInsights.patterns,
+    );
+    const scaffold = generateDescriptionScaffold(issueType, teamInsights.templates);
+    const insightsSection = formatInsightsSection(
+      smartDefaults,
+      scaffold,
+      teamInsights.estimation,
+      ticketCtx,
+      teamInsights.patterns.reworkRates,
+    );
+
     const previewData: PreviewData = {
       fields: buildFields({ summary: params.summary, issueType, ...params }),
       description: params.description,
@@ -134,6 +172,7 @@ export async function handleCreateAction(
       duplicates,
       schemaGuidance: buildSchemaGuidance(schema, issueType),
       fieldRules: FIELD_RULES,
+      insights: insightsSection || undefined,
     };
 
     let out = buildPreviewCard(previewData);
@@ -224,6 +263,33 @@ export async function handleBulkCreateAction(
     const merged = mergeWithDefaults(rules, DEFAULT_RULES);
     const schemaGuidance = buildSchemaGuidance(schema, issueType);
 
+    // Team insights — load once, apply to first ticket
+    const teamInsights = loadTeamInsights(kb);
+    const firstTicket = params.tickets[0] as (typeof params.tickets)[number];
+    const bulkTicketCtx: TicketContext = {
+      summary: firstTicket.summary,
+      issueType: firstTicket.issueType,
+      description: firstTicket.description,
+      components: firstTicket.components,
+      labels: firstTicket.labels,
+      storyPoints: firstTicket.storyPoints,
+      priority: firstTicket.priority,
+    };
+    const bulkDefaults = generateSmartDefaults(
+      bulkTicketCtx,
+      teamInsights.estimation,
+      teamInsights.ownership,
+      teamInsights.patterns,
+    );
+    const bulkScaffold = generateDescriptionScaffold(issueType, teamInsights.templates);
+    const bulkInsights = formatInsightsSection(
+      bulkDefaults,
+      bulkScaffold,
+      teamInsights.estimation,
+      bulkTicketCtx,
+      teamInsights.patterns.reworkRates,
+    );
+
     const previews: PreviewData[] = params.tickets.map((t, i) => {
       const conventions = evaluateConventions(
         {
@@ -254,6 +320,7 @@ export async function handleBulkCreateAction(
         duplicates: i === 0 ? firstDuplicates : [],
         schemaGuidance: i === 0 ? schemaGuidance : undefined,
         fieldRules: i === 0 ? FIELD_RULES : undefined,
+        insights: i === 0 && bulkInsights ? bulkInsights : undefined,
       };
     });
 

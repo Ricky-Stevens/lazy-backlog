@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { JiraClient } from "../lib/jira.js";
 import { findDuplicates, jaccardSimilarity, tokenize } from "../lib/duplicate-detect.js";
+import type { JiraClient } from "../lib/jira.js";
 
 // ── tokenize ─────────────────────────────────────────────────────────────
 
@@ -140,17 +140,11 @@ describe("findDuplicates", () => {
   it("includes description in token matching when provided", async () => {
     const jira = mockJira([{ key: "PROJ-1", summary: "Fix authentication timeout errors", status: "Open" }]);
 
-    const results = await findDuplicates(
-      jira,
-      "Fix auth errors",
-      "authentication timeout occurring during login",
-      "PROJ",
-      0.1,
-    );
+    await findDuplicates(jira, "Fix auth errors", "authentication timeout occurring during login", "PROJ", 0.1);
 
     expect(jira.searchIssues).toHaveBeenCalledTimes(1);
-    // The JQL should contain keywords from the combined text
-    const jql = (jira.searchIssues as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const calls = (jira.searchIssues as ReturnType<typeof vi.fn>).mock.calls;
+    const jql = calls[0]?.[0] as string;
     expect(jql).toContain('project = "PROJ"');
   });
 
