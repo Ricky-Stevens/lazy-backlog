@@ -1131,6 +1131,13 @@ describe("JiraClient", () => {
       expect(body.outwardIssue).toEqual({ key: "BP-2" });
     });
 
+    it("handles 201 with empty body", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      fetchMock.mockResolvedValueOnce(new Response("", { status: 201 }));
+
+      await expect(client.linkIssues("BP-1", "BP-2", "Relates")).resolves.toBeUndefined();
+    });
+
     it("validates both issue keys", async () => {
       const client = new JiraClient(testConfig, testSchema);
       await expect(client.linkIssues("bad", "BP-2", "Blocks")).rejects.toThrow("Invalid issue key");
