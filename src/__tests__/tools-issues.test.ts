@@ -1172,6 +1172,195 @@ describe("registerIssuesTool", () => {
       assignSpy.mockRestore();
       linkSpy.mockRestore();
     });
+
+    it("removes links by target key and link type", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([
+        {
+          id: "10001",
+          type: "Blocks",
+          direction: "inward",
+          linkedIssue: { key: "BP-5", summary: "Blocker", status: "To Do" },
+        },
+        {
+          id: "10002",
+          type: "Relates",
+          direction: "outward",
+          linkedIssue: { key: "BP-6", summary: "Related", status: "Done" },
+        },
+      ]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [{ targetKey: "BP-5", linkType: "Blocks" }],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("1 link(s) removed");
+      expect(getLinksSpy).toHaveBeenCalledWith("BP-1");
+      expect(removeSpy).toHaveBeenCalledWith("10001");
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("removes multiple links in one call", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([
+        {
+          id: "10001",
+          type: "Blocks",
+          direction: "inward",
+          linkedIssue: { key: "BP-5", summary: "Blocker", status: "To Do" },
+        },
+        {
+          id: "10002",
+          type: "Relates",
+          direction: "outward",
+          linkedIssue: { key: "BP-6", summary: "Related", status: "Done" },
+        },
+      ]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [
+          { targetKey: "BP-5", linkType: "Blocks" },
+          { targetKey: "BP-6", linkType: "Relates" },
+        ],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("2 link(s) removed");
+      expect(removeSpy).toHaveBeenCalledTimes(2);
+      expect(removeSpy).toHaveBeenCalledWith("10001");
+      expect(removeSpy).toHaveBeenCalledWith("10002");
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("reports 0 removed when no matching link found", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([
+        {
+          id: "10001",
+          type: "Blocks",
+          direction: "inward",
+          linkedIssue: { key: "BP-5", summary: "Blocker", status: "To Do" },
+        },
+      ]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [{ targetKey: "BP-99", linkType: "Blocks" }],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("0 link(s) removed");
+      expect(removeSpy).not.toHaveBeenCalled();
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("does not match when link type differs", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([
+        {
+          id: "10001",
+          type: "Blocks",
+          direction: "inward",
+          linkedIssue: { key: "BP-5", summary: "Blocker", status: "To Do" },
+        },
+      ]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [{ targetKey: "BP-5", linkType: "Relates" }],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("0 link(s) removed");
+      expect(removeSpy).not.toHaveBeenCalled();
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("handles partial match when removing multiple links", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([
+        {
+          id: "10001",
+          type: "Blocks",
+          direction: "inward",
+          linkedIssue: { key: "BP-5", summary: "Blocker", status: "To Do" },
+        },
+      ]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [
+          { targetKey: "BP-5", linkType: "Blocks" },
+          { targetKey: "BP-99", linkType: "Blocks" },
+        ],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("1 link(s) removed");
+      expect(removeSpy).toHaveBeenCalledTimes(1);
+      expect(removeSpy).toHaveBeenCalledWith("10001");
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("reports 0 removed when issue has no links at all", async () => {
+      const { server, getTool } = createMockServer();
+      registerIssuesTool(server, () => kb);
+      JiraClient.saveSchemaToDb(kb, testSchema);
+
+      const getLinksSpy = vi.spyOn(JiraClient.prototype, "getIssueLinks").mockResolvedValue([]);
+      const removeSpy = vi.spyOn(JiraClient.prototype, "removeIssueLink").mockResolvedValue(undefined);
+
+      const issues = getTool("issues");
+      const result = await issues({
+        action: "update",
+        issueKey: "BP-1",
+        removeLinks: [{ targetKey: "BP-5", linkType: "Blocks" }],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(getText(result)).toContain("0 link(s) removed");
+      expect(removeSpy).not.toHaveBeenCalled();
+
+      getLinksSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
   });
 
   describe("action=search", () => {

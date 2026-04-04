@@ -53,6 +53,7 @@ interface IssueParams {
   status?: string;
   assignee?: string;
   links?: Array<{ targetKey: string; linkType: string; direction: "inward" | "outward" }>;
+  removeLinks?: Array<{ targetKey: string; linkType: string }>;
   spaceKey?: string;
 }
 
@@ -128,6 +129,24 @@ async function applyLinks(
   changes.push(`Links: ${links.length} link(s) created`);
 }
 
+async function applyRemoveLinks(
+  jira: InstanceType<typeof JiraClient>,
+  issueKey: string,
+  removeLinks: NonNullable<IssueParams["removeLinks"]>,
+  changes: string[],
+) {
+  const existingLinks = await jira.getIssueLinks(issueKey);
+  let removed = 0;
+  for (const toRemove of removeLinks) {
+    const match = existingLinks.find((l) => l.type === toRemove.linkType && l.linkedIssue.key === toRemove.targetKey);
+    if (match) {
+      await jira.removeIssueLink(match.id);
+      removed++;
+    }
+  }
+  changes.push(`Links: ${removed} link(s) removed`);
+}
+
 async function applyRanking(
   jira: InstanceType<typeof JiraClient>,
   issueKey: string,
@@ -184,6 +203,10 @@ async function handleUpdateAction(params: IssueParams, kb: KnowledgeBase) {
 
     if (params.links?.length) {
       await applyLinks(jira, params.issueKey, params.links, changes);
+    }
+
+    if (params.removeLinks?.length) {
+      await applyRemoveLinks(jira, params.issueKey, params.removeLinks, changes);
     }
 
     if (params.rankBefore || params.rankAfter) {
@@ -301,6 +324,15 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
           )
           .optional()
           .describe("[update] Create issue links"),
+        removeLinks: z
+          .array(
+            z.object({
+              targetKey: z.string().describe("Issue key of the linked issue to remove"),
+              linkType: z.string().describe("Link type name, e.g. 'Blocks', 'Relates'"),
+            }),
+          )
+          .optional()
+          .describe("[update] Remove issue links by target key and link type"),
         spaceKey: z.string().optional().describe("[create] Confluence space key to search for relevant context"),
       }),
     },

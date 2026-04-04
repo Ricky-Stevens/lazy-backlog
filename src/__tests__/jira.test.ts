@@ -1231,12 +1231,13 @@ describe("JiraClient", () => {
   });
 
   describe("getIssueLinks", () => {
-    it("parses inward and outward links correctly", async () => {
+    it("parses inward and outward links correctly with ids", async () => {
       const client = new JiraClient(testConfig, testSchema);
       mockFetchResponse({
         fields: {
           issuelinks: [
             {
+              id: "10001",
               type: { name: "Blocks" },
               inwardIssue: {
                 key: "BP-10",
@@ -1244,6 +1245,7 @@ describe("JiraClient", () => {
               },
             },
             {
+              id: "10002",
               type: { name: "Relates" },
               outwardIssue: {
                 key: "BP-20",
@@ -1257,15 +1259,69 @@ describe("JiraClient", () => {
       const links = await client.getIssueLinks("BP-1");
       expect(links).toHaveLength(2);
       expect(links[0]).toEqual({
+        id: "10001",
         type: "Blocks",
         direction: "inward",
         linkedIssue: { key: "BP-10", summary: "Blocker issue", status: "To Do" },
       });
       expect(links[1]).toEqual({
+        id: "10002",
         type: "Relates",
         direction: "outward",
         linkedIssue: { key: "BP-20", summary: "Related issue", status: "Done" },
       });
+    });
+
+    it("handles link with both inward and outward on same entry", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchResponse({
+        fields: {
+          issuelinks: [
+            {
+              id: "10003",
+              type: { name: "Blocks" },
+              inwardIssue: {
+                key: "BP-10",
+                fields: { summary: "First", status: { name: "To Do" } },
+              },
+              outwardIssue: {
+                key: "BP-20",
+                fields: { summary: "Second", status: { name: "Done" } },
+              },
+            },
+          ],
+        },
+      });
+
+      const links = await client.getIssueLinks("BP-1");
+      expect(links).toHaveLength(2);
+      expect(links[0]?.direction).toBe("inward");
+      expect(links[0]?.id).toBe("10003");
+      expect(links[1]?.direction).toBe("outward");
+      expect(links[1]?.id).toBe("10003");
+    });
+
+    it("defaults missing summary and status fields gracefully", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchResponse({
+        fields: {
+          issuelinks: [
+            {
+              id: "10004",
+              type: { name: "Blocks" },
+              inwardIssue: {
+                key: "BP-30",
+                fields: { summary: undefined, status: undefined },
+              },
+            },
+          ],
+        },
+      });
+
+      const links = await client.getIssueLinks("BP-1");
+      expect(links).toHaveLength(1);
+      expect(links[0]?.linkedIssue.summary).toBe("");
+      expect(links[0]?.linkedIssue.status).toBe("Unknown");
     });
 
     it("returns empty array when no links exist", async () => {
@@ -1279,6 +1335,57 @@ describe("JiraClient", () => {
     it("validates issue key", async () => {
       const client = new JiraClient(testConfig, testSchema);
       await expect(client.getIssueLinks("bad")).rejects.toThrow("Invalid issue key");
+    });
+
+    it("propagates HTTP errors from the API", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchError(404, '{"errorMessages":["Issue does not exist"]}');
+
+      await expect(client.getIssueLinks("BP-999")).rejects.toThrow("Jira 404");
+    });
+  });
+
+  describe("removeIssueLink", () => {
+    it("sends DELETE request with correct link ID", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      await client.removeIssueLink("10001");
+
+      const url = fetchMock.mock.calls[0]?.[0] as string;
+      expect(url).toContain("/rest/api/3/issueLink/10001");
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("DELETE");
+    });
+
+    it("handles successful removal with no content", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      await expect(client.removeIssueLink("10001")).resolves.toBeUndefined();
+    });
+
+    it("encodes link ID in the URL path", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      await client.removeIssueLink("100/01");
+
+      const url = fetchMock.mock.calls[0]?.[0] as string;
+      expect(url).toContain("/rest/api/3/issueLink/100%2F01");
+    });
+
+    it("propagates 404 when link does not exist", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchError(404, '{"errorMessages":["Issue Link does not exist"]}');
+
+      await expect(client.removeIssueLink("99999")).rejects.toThrow("Jira 404");
+    });
+
+    it("propagates 403 when user lacks permission", async () => {
+      const client = new JiraClient(testConfig, testSchema);
+      mockFetchError(403, '{"errorMessages":["You do not have permission"]}');
+
+      await expect(client.removeIssueLink("10001")).rejects.toThrow("Jira 403");
     });
   });
 

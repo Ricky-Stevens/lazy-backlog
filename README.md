@@ -188,7 +188,7 @@ Create, update, search, and decompose Jira issues. **Creates always preview firs
 |--------|-------------|
 | `get` | Full issue details with cycle time context vs team averages. Flags at-risk items exceeding P75 cycle time. |
 | `create` | Single ticket, bulk (pass `tickets` array), or epic decomposition (pass `epicKey`). Preview includes smart defaults, team conventions, KB context, duplicates, and similar resolved issues with typical effort range. |
-| `update` | Modify fields, transition status, assign, rank, link. Shows enrichment suggestions for missing fields. On status transition to Done: shows impact ripple (unblocked issues + epic progress delta). |
+| `update` | Modify fields, transition status, assign, rank, link, remove links. Shows enrichment suggestions for missing fields. On status transition to Done: shows impact ripple (unblocked issues + epic progress delta). |
 | `search` | Universal JQL search (auto-scoped to project). Results include analytics: status breakdown, average age, priority distribution, unassigned count. |
 
 > *"Create a task for migrating to OAuth2"* — review preview — *"Looks good, confirm"*

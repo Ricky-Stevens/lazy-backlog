@@ -252,6 +252,9 @@ export class JiraClient {
   async linkIssues(inwardKey: string, outwardKey: string, linkType: string) {
     return agile.linkIssues(this.req, inwardKey, outwardKey, linkType);
   }
+  async removeIssueLink(linkId: string) {
+    return agile.removeIssueLink(this.req, linkId);
+  }
   async getIssueLinkTypes() {
     return agile.getIssueLinkTypes(this.req);
   }

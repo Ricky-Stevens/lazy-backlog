@@ -308,6 +308,7 @@ export async function getIssueLinks(
   issueKey: string,
 ): Promise<
   Array<{
+    id: string;
     type: string;
     direction: "inward" | "outward";
     linkedIssue: { key: string; summary: string; status: string };
@@ -317,6 +318,7 @@ export async function getIssueLinks(
   const raw = await request<{
     fields: {
       issuelinks: Array<{
+        id: string;
         type: { name: string };
         inwardIssue?: { key: string; fields: { summary: string; status: { name: string } } };
         outwardIssue?: { key: string; fields: { summary: string; status: { name: string } } };
@@ -325,6 +327,7 @@ export async function getIssueLinks(
   }>("GET", `/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=issuelinks`);
 
   const links: Array<{
+    id: string;
     type: string;
     direction: "inward" | "outward";
     linkedIssue: { key: string; summary: string; status: string };
@@ -332,6 +335,7 @@ export async function getIssueLinks(
   for (const link of raw.fields.issuelinks) {
     if (link.inwardIssue) {
       links.push({
+        id: link.id,
         type: link.type.name,
         direction: "inward",
         linkedIssue: {
@@ -343,6 +347,7 @@ export async function getIssueLinks(
     }
     if (link.outwardIssue) {
       links.push({
+        id: link.id,
         type: link.type.name,
         direction: "outward",
         linkedIssue: {
@@ -354,6 +359,11 @@ export async function getIssueLinks(
     }
   }
   return links;
+}
+
+/** Remove an issue link by its ID. */
+export async function removeIssueLink(request: RequestFn, linkId: string): Promise<void> {
+  await request<void>("DELETE", `/rest/api/3/issueLink/${encodeURIComponent(linkId)}`);
 }
 
 // ── Dev Status ───────────────────────────────────────────────────────────────
