@@ -1,25 +1,33 @@
 /**
  * Jira Agile REST API operations — sprints, backlog, ranking, board search,
- * transitions, links, changelog, comments, labels, and dev status.
+ * changelog, comments, labels, and dev status.
+ *
+ * Issue-link / transition / assignee operations live in jira-agile-links.ts and
+ * are re-exported here so existing callers keep their import paths.
  *
  * All functions accept a `request` callback for use by JiraClient without circular deps.
  */
 import { markdownToAdf } from "./adf.js";
-import type {
-  ChangelogEntry,
-  ChangelogResponse,
-  IssueLinkTypesResponse,
-  JiraSprint,
-  SearchIssue,
-  SprintListResponse,
-  TransitionsResponse,
-} from "./jira-types.js";
+import type { ChangelogEntry, ChangelogResponse, JiraSprint, SearchIssue, SprintListResponse } from "./jira-types.js";
 
 export type RequestFn = <T>(method: string, path: string, body?: unknown) => Promise<T>;
 const ISSUE_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/;
 function validateIssueKey(key: string): void {
   if (!ISSUE_KEY_RE.test(key)) throw new Error(`Invalid issue key: "${key}" — expected format like ABC-123`);
 }
+
+// Re-export issue-link / transition / assignee operations so existing imports
+// from "./jira-agile.js" keep working unchanged.
+export {
+  addRemoteLink,
+  assignIssue,
+  getIssueLinks,
+  getIssueLinkTypes,
+  getTransitions,
+  linkIssues,
+  removeIssueLink,
+  transitionIssue,
+} from "./jira-agile-links.js";
 
 // ── Sprints ──────────────────────────────────────────────────────────────────
 
@@ -128,58 +136,7 @@ export async function updateSprint(
   await request<void>("PUT", `/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}`, updates);
 }
 
-// ── Transitions & Links ──────────────────────────────────────────────────────
-
-/** Get available transitions for an issue. */
-export async function getTransitions(
-  request: RequestFn,
-  issueKey: string,
-): Promise<Array<{ id: string; name: string; to: { name: string } }>> {
-  validateIssueKey(issueKey);
-  const res = await request<TransitionsResponse>(
-    "GET",
-    `/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`,
-  );
-  return res.transitions;
-}
-
-/** Transition an issue to a new status. */
-export async function transitionIssue(request: RequestFn, issueKey: string, transitionId: string): Promise<void> {
-  validateIssueKey(issueKey);
-  await request<void>("POST", `/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
-    transition: { id: transitionId },
-  });
-}
-
-/** Assign an issue to a user (null to unassign). */
-export async function assignIssue(request: RequestFn, issueKey: string, accountId: string | null): Promise<void> {
-  validateIssueKey(issueKey);
-  await request<void>("PUT", `/rest/api/3/issue/${encodeURIComponent(issueKey)}/assignee`, { accountId });
-}
-
-/** Create a link between two issues. */
-export async function linkIssues(
-  request: RequestFn,
-  inwardKey: string,
-  outwardKey: string,
-  linkType: string,
-): Promise<void> {
-  validateIssueKey(inwardKey);
-  validateIssueKey(outwardKey);
-  await request<void>("POST", "/rest/api/3/issueLink", {
-    type: { name: linkType },
-    inwardIssue: { key: inwardKey },
-    outwardIssue: { key: outwardKey },
-  });
-}
-
-/** Get available issue link types. */
-export async function getIssueLinkTypes(
-  request: RequestFn,
-): Promise<Array<{ name: string; inward: string; outward: string }>> {
-  const res = await request<IssueLinkTypesResponse>("GET", "/rest/api/3/issueLinkType");
-  return res.issueLinkTypes;
-}
+// ── Transitions, assignee, links, remote links — see jira-agile-links.ts ────
 
 // ── Changelog ────────────────────────────────────────────────────────────────
 
@@ -300,71 +257,7 @@ export async function searchBacklogIssues(
   return { issues: res.issues, total: res.total };
 }
 
-// ── Issue Links (detail) ─────────────────────────────────────────────────────
-
-/** Get links for an issue, parsed into a flat array with direction info. */
-export async function getIssueLinks(
-  request: RequestFn,
-  issueKey: string,
-): Promise<
-  Array<{
-    id: string;
-    type: string;
-    direction: "inward" | "outward";
-    linkedIssue: { key: string; summary: string; status: string };
-  }>
-> {
-  validateIssueKey(issueKey);
-  const raw = await request<{
-    fields: {
-      issuelinks: Array<{
-        id: string;
-        type: { name: string };
-        inwardIssue?: { key: string; fields: { summary: string; status: { name: string } } };
-        outwardIssue?: { key: string; fields: { summary: string; status: { name: string } } };
-      }>;
-    };
-  }>("GET", `/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=issuelinks`);
-
-  const links: Array<{
-    id: string;
-    type: string;
-    direction: "inward" | "outward";
-    linkedIssue: { key: string; summary: string; status: string };
-  }> = [];
-  for (const link of raw.fields.issuelinks) {
-    if (link.inwardIssue) {
-      links.push({
-        id: link.id,
-        type: link.type.name,
-        direction: "inward",
-        linkedIssue: {
-          key: link.inwardIssue.key,
-          summary: link.inwardIssue.fields?.summary ?? "",
-          status: link.inwardIssue.fields?.status?.name ?? "Unknown",
-        },
-      });
-    }
-    if (link.outwardIssue) {
-      links.push({
-        id: link.id,
-        type: link.type.name,
-        direction: "outward",
-        linkedIssue: {
-          key: link.outwardIssue.key,
-          summary: link.outwardIssue.fields?.summary ?? "",
-          status: link.outwardIssue.fields?.status?.name ?? "Unknown",
-        },
-      });
-    }
-  }
-  return links;
-}
-
-/** Remove an issue link by its ID. */
-export async function removeIssueLink(request: RequestFn, linkId: string): Promise<void> {
-  await request<void>("DELETE", `/rest/api/3/issueLink/${encodeURIComponent(linkId)}`);
-}
+// ── Issue Links (detail) — see jira-agile-links.ts ──────────────────────────
 
 // ── Dev Status ───────────────────────────────────────────────────────────────
 

@@ -1,9 +1,19 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { buildJiraClient, errorResponse, formatLabels, textResponse } from "../lib/config.js";
+import type { ConfluenceAttachment } from "../lib/confluence.js";
 import type { KnowledgeBase, PageSummary } from "../lib/db.js";
-import { loadSchemaFromDb } from "../lib/jira-schema.js";
+import { loadPageAttachments } from "../lib/indexer.js";
+import {
+  formatPageAttachments,
+  type KnowledgeDownloadParams,
+  runPageAttachmentDownloads,
+} from "./knowledge-attachments.js";
+import { handleStats } from "./knowledge-stats.js";
 import { buildSuggestions } from "./suggestions.js";
+
+export * from "./knowledge-attachments.js";
+export * from "./knowledge-stats.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -12,48 +22,23 @@ type ToolResponse = {
   isError?: boolean;
 };
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants & pagination helpers (moved to knowledge-pagination.ts) ───────
 
-export const MAX_PAGE_CHARS = 15_000;
-export const MAX_CONTEXT_CHARS = 20_000;
+export {
+  MAX_PAGE_CHARS,
+  MAX_PAGE_SIZE,
+  MIN_PAGE_SIZE,
+  type PaginationWindow,
+  paginateContent,
+} from "./knowledge-pagination.js";
 
-const STALE_CUTOFF_DAYS = 90;
-const RECENT_DAYS = 7;
+import { MAX_PAGE_CHARS, MAX_PAGE_SIZE, MIN_PAGE_SIZE, paginateContent } from "./knowledge-pagination.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function formatSummaryLine(s: PageSummary): string {
   const preview = s.content_preview.replaceAll("\n", " ").trim();
   return `- **${s.title}** (${s.space_key}) [${formatLabels(s.labels)}]\n  ${preview}\u2026`;
-}
-
-export function appendSection(
-  pages: PageSummary[],
-  heading: string,
-  maxItems: number,
-  budget: number,
-  emit: (s: string) => void,
-): number {
-  if (pages.length === 0 || budget <= 0) return budget;
-
-  const header = `## ${heading} (${pages.length})\n\n`;
-  emit(header);
-  budget -= header.length;
-
-  const items = pages.slice(0, maxItems);
-  for (let i = 0; i < items.length; i++) {
-    if (budget <= 100) {
-      emit(`\u2026and ${pages.length - i} more\n\n`);
-      break;
-    }
-    const p = items[i];
-    if (!p) continue;
-    const entry = `### ${p.title}\n${p.content_preview.trim()}\n\n`;
-    emit(entry);
-    budget -= entry.length;
-  }
-
-  return budget;
 }
 
 // ── Intelligence Helpers ─────────────────────────────────────────────────────
@@ -143,157 +128,47 @@ function handleSearch(
   return textResponse(`${results.length} results:\n\n${lines.join("\n\n")}${pageSummary}`);
 }
 
-function handleStats(
-  params: { source?: string; spaceKey?: string; pageType?: string },
+async function handleGetPage(
+  params: { pageId?: string; page?: number; pageSize?: number } & KnowledgeDownloadParams,
   kb: KnowledgeBase,
-): ToolResponse {
-  const stats = kb.getStats();
-  if (stats.total === 0) return textResponse("Knowledge base is empty.");
-
-  // ── Counts by type / space / source ──
-  const types = Object.entries(stats.byType)
-    .map(([k, v]) => `  ${k}: ${v}`)
-    .join("\n");
-  const spaces = Object.entries(stats.bySpace)
-    .map(([k, v]) => `  ${k}: ${v}`)
-    .join("\n");
-
-  let out = `# Knowledge Base Dashboard\n\n`;
-  out += `**Total pages:** ${stats.total}\n\n`;
-  out += `By type:\n${types}\n\nBy space:\n${spaces}`;
-
-  if (stats.bySource) {
-    const sources = Object.entries(stats.bySource)
-      .map(([k, v]) => `  ${k}: ${v}`)
-      .join("\n");
-    out += `\n\nBy source:\n${sources}`;
-  }
-
-  // ── Coverage gap detection ──
-  try {
-    const gaps: string[] = [];
-    if (!stats.byType.adr) gaps.push("No ADRs indexed — consider documenting architectural decisions.");
-    if (!stats.byType.runbook) gaps.push("No runbooks indexed — consider documenting operational procedures.");
-
-    const schema = loadSchemaFromDb(kb);
-    if (schema) {
-      const components = new Set<string>();
-      for (const issueType of schema.issueTypes) {
-        const compField = issueType.fields.find((f) => f.id === "components");
-        for (const v of compField?.allowedValues ?? []) components.add(v.name);
-      }
-      if (components.size > 0) {
-        const undocumented: string[] = [];
-        for (const comp of components) {
-          const results = kb.search(comp, { limit: 1 });
-          if (results.length === 0) undocumented.push(comp);
-        }
-        if (undocumented.length > 0) {
-          gaps.push(`No documentation found for components: ${undocumented.join(", ")}.`);
-        }
-      }
-    }
-    if (gaps.length > 0) {
-      out += `\n\n**Coverage Gaps:**\n${gaps.map((g) => `- ${g}`).join("\n")}`;
-    }
-  } catch {
-    /* graceful: skip coverage gap detection */
-  }
-
-  // ── Context summary (ADRs, designs, specs) ──
-  const adrs = kb.getPageSummaries("adr", params.spaceKey, params.source);
-  const designs = kb.getPageSummaries("design", params.spaceKey, params.source);
-  const specs = kb.getPageSummaries("spec", params.spaceKey, params.source);
-
-  if (adrs.length > 0 || designs.length > 0 || specs.length > 0) {
-    out += "\n\n---\n\n# Context Summary\n\n";
-    let budget = MAX_CONTEXT_CHARS - out.length;
-
-    budget = appendSection(adrs, "ADRs", 20, budget, (s) => {
-      out += s;
-    });
-    budget = appendSection(designs, "Design Docs", 10, budget, (s) => {
-      out += s;
-    });
-    appendSection(specs, "Specs", 10, budget, (s) => {
-      out += s;
-    });
-  }
-
-  // ── Recent changes (last 7 days) ──
-  const recentCutoff = new Date();
-  recentCutoff.setDate(recentCutoff.getDate() - RECENT_DAYS);
-  const recentPages = kb.getRecentlyIndexed(recentCutoff.toISOString(), params.source);
-
-  if (recentPages.length > 0) {
-    out += `\n\n---\n\n## Recent Changes (last ${RECENT_DAYS} days): ${recentPages.length}\n\n`;
-    const shown = recentPages.slice(0, 10);
-    for (const p of shown) {
-      out += `- **${p.title}** (${p.space_key}) [${p.page_type}] indexed ${p.indexed_at.slice(0, 10)}\n`;
-    }
-    if (recentPages.length > 10) {
-      out += `\u2026and ${recentPages.length - 10} more\n`;
-    }
-  } else {
-    out += `\n\n---\n\n## Recent Changes (last ${RECENT_DAYS} days): none\n`;
-  }
-
-  // ── Stale docs (90-day cutoff) ──
-  const staleCutoff = new Date();
-  staleCutoff.setDate(staleCutoff.getDate() - STALE_CUTOFF_DAYS);
-  const stalePages = kb.getStalePages(staleCutoff.toISOString(), {
-    spaceKey: params.spaceKey,
-    pageType: params.pageType,
-    source: params.source,
-  });
-
-  if (stalePages.length > 0) {
-    out += `\n## Stale Docs (>${STALE_CUTOFF_DAYS} days): ${stalePages.length}\n\n`;
-    const top5 = stalePages.slice(0, 5);
-    for (const p of top5) {
-      const daysAgo = Math.floor(
-        (Date.now() - new Date(p.updated_at ?? p.indexed_at).getTime()) / (1000 * 60 * 60 * 24),
-      );
-      out += `- **${p.title}** (${p.space_key}) [${p.page_type}] \u2014 ${daysAgo}d ago\n`;
-    }
-    if (stalePages.length > 5) {
-      out += `\u2026and ${stalePages.length - 5} more\n`;
-    }
-  }
-
-  // ── KB Health Indicator ──
-  const freshCount = stats.total - stalePages.length;
-  const freshPct = Math.round((freshCount / stats.total) * 100);
-  let health: string;
-  if (freshPct > 80) {
-    health = "healthy";
-  } else if (freshPct >= 50) {
-    health = "needs-attention";
-  } else {
-    health = "stale";
-  }
-  out += `\n## KB Health: **${health}** (${freshPct}% of pages updated within ${STALE_CUTOFF_DAYS} days)\n`;
-
-  const suggestions = buildSuggestions("knowledge", "stats", { staleCount: stalePages.length });
-  return textResponse(out + suggestions);
-}
-
-async function handleGetPage(params: { pageId?: string }, kb: KnowledgeBase): Promise<ToolResponse> {
+): Promise<ToolResponse> {
   if (!params.pageId) return errorResponse("'pageId' is required for get-page action.");
   const page = kb.getPage(params.pageId);
   if (!page) return errorResponse(`Page ${params.pageId} not found in knowledge base.`);
 
-  const body =
-    page.content.length > MAX_PAGE_CHARS
-      ? `${page.content.slice(0, MAX_PAGE_CHARS)}\n\n\u2026[truncated \u2014 ${page.content.length} chars total]`
-      : page.content;
+  // E2 \u2014 Pagination instead of silent 15k truncation. Long pages return the
+  // requested window with explicit continuation metadata so callers can fetch
+  // the remainder by incrementing `page`.
+  const requestedPage = params.page ?? 1;
+  const requestedSize = params.pageSize ?? MAX_PAGE_CHARS;
+  const window = paginateContent(page.content, requestedPage, requestedSize);
 
-  // Freshness indicator
+  let body = window.body;
+  let paginationNote = "";
+  if (window.totalPages > 1) {
+    paginationNote =
+      `\n\n---\n**Page ${window.page} of ${window.totalPages}** ` +
+      `(${window.body.length}/${window.totalChars} chars; window=${window.effectiveSize}).` +
+      (window.hasMore
+        ? `\nFetch next: \`knowledge get-page\` with \`pageId='${page.id}'\` and \`page=${window.page + 1}\`.`
+        : `\nThis is the final page \u2014 call with \`page=1\` to start over.`);
+    body = `${body}${paginationNote}`;
+  }
+
+  // Freshness indicator. PAG-7: clamp negative day deltas to 0 so a
+  // future-dated `updated_at` (clock skew, fixture data) isn't mislabelled as
+  // "Fresh (-5d ago)" — that leaked a data-quality signal through what is
+  // meant to be a recency indicator. Future dates render as "Future-dated
+  // (clock skew?)" so the issue is visible without making the label lie.
   let freshness = "";
   if (page.updated_at) {
-    const daysAgo = Math.floor((Date.now() - new Date(page.updated_at).getTime()) / 86_400_000);
-    const label = daysAgo < 30 ? "Fresh" : daysAgo < 90 ? "Aging" : "Stale — may need review";
-    freshness = ` | **${label}** (${daysAgo}d ago)`;
+    const rawDays = Math.floor((Date.now() - new Date(page.updated_at).getTime()) / 86_400_000);
+    if (rawDays < 0) {
+      freshness = ` | **Future-dated (clock skew?)** (${rawDays}d)`;
+    } else {
+      const label = rawDays < 30 ? "Fresh" : rawDays < 90 ? "Aging" : "Stale — may need review";
+      freshness = ` | **${label}** (${rawDays}d ago)`;
+    }
   }
 
   // Related pages: search KB for pages with similar title keywords
@@ -334,11 +209,32 @@ async function handleGetPage(params: { pageId?: string }, kb: KnowledgeBase): Pr
     /* graceful: skip if Jira not configured */
   }
 
+  // Attachment manifest (graceful — empty list when none stored)
+  let attachmentsSection = "";
+  let downloadSection = "";
+  let attachments: ConfluenceAttachment[] = [];
+  try {
+    attachments = loadPageAttachments(kb, page.id);
+    attachmentsSection = formatPageAttachments(attachments);
+  } catch {
+    /* graceful: skip attachments */
+  }
+  if (params.download && attachments.length > 0) {
+    downloadSection = await runPageAttachmentDownloads(kb, attachments, params);
+  }
+
+  const suggestions = buildSuggestions("knowledge", "get-page", {
+    attachmentCount: attachments.length,
+    downloaded: downloadSection.length > 0,
+    totalPages: window.totalPages,
+    hasMore: window.hasMore,
+  });
+
   return textResponse(
     `# ${page.title}\n` +
       `${page.page_type} | ${page.space_key} | ${formatLabels(page.labels)} | ${page.updated_at ?? "?"}${freshness}\n` +
       (page.url ? `${page.url}\n` : "") +
-      `---\n${body}${relatedSection}${ticketRefs}`,
+      `---\n${body}${attachmentsSection}${downloadSection}${relatedSection}${ticketRefs}${suggestions}`,
   );
 }
 
@@ -361,6 +257,36 @@ export function registerKnowledgeTool(server: McpServer, getKb: () => KnowledgeB
           .describe("Filter results by page type"),
         spaceKey: z.string().optional().describe("Filter by namespace/space key"),
         limit: z.number().default(5).describe("[search] Max results to return"),
+        download: z
+          .boolean()
+          .default(false)
+          .optional()
+          .describe(
+            "[get-page] When true, fetch page attachments to the configured download directory (config key 'downloadDir').",
+          ),
+        attachmentIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "[get-page] Optional filter — only download attachments whose id or filename appears in this list. Defaults to all attachments.",
+          ),
+        page: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "[get-page] 1-based pagination window. Default 1. Long pages return continuation metadata pointing to page+1.",
+          ),
+        pageSize: z
+          .number()
+          .int()
+          .min(MIN_PAGE_SIZE)
+          .max(MAX_PAGE_SIZE)
+          .optional()
+          .describe(
+            `[get-page] Window size in characters. Default ${MAX_PAGE_CHARS}. Clamped to [${MIN_PAGE_SIZE}, ${MAX_PAGE_SIZE}].`,
+          ),
       }),
     },
     async (params) => {

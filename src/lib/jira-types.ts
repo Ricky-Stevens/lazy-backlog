@@ -39,6 +39,23 @@ export interface CreatedTicket {
   self: string;
 }
 
+/** A single Jira attachment as returned by the REST API. */
+export interface JiraAttachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  /** Size in bytes. */
+  size: number;
+  author?: string;
+  created: string;
+  /** Direct download URL (Atlassian content URL — may be on a different host). */
+  url: string;
+  /** Optional thumbnail URL when available. */
+  thumbnail?: string;
+  /** True when mimeType indicates an image. */
+  isImage: boolean;
+}
+
 /** Full issue details returned by getIssue(). */
 export interface JiraIssueDetail {
   key: string;
@@ -57,6 +74,7 @@ export interface JiraIssueDetail {
   created: string;
   updated: string;
   comments: { author: string; created: string; body: string }[];
+  attachments: JiraAttachment[];
   url: string;
 }
 
@@ -254,8 +272,21 @@ export interface RawIssueResponse {
         body: Record<string, unknown>;
       }>;
     };
+    attachment?: RawAttachment[];
     [customField: string]: unknown;
   };
+}
+
+/** Raw attachment shape from the Jira REST API. */
+export interface RawAttachment {
+  id: string;
+  filename: string;
+  mimeType?: string;
+  size: number;
+  author?: { displayName?: string };
+  created: string;
+  content: string;
+  thumbnail?: string;
 }
 
 /** Shared shape for field resolution across create/update. */

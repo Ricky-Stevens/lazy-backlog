@@ -8,14 +8,15 @@ import type { ProjectConfig } from "../config/schema.js";
 import { adfToText, markdownToAdf } from "./adf.js";
 import { fetchWithRetry } from "./http-utils.js";
 import * as agile from "./jira-agile.js";
+import { type AttachmentUpload, mapAttachment, uploadAttachments } from "./jira-attachments.js";
 import { authHeaders, validateSiteUrl } from "./jira-auth.js";
+import { autoFillRequired, buildFieldGuide, resolveCustomFields, resolveFieldId } from "./jira-fields.js";
 import { discoverSchema, loadSchema, loadSchemaFromDb, saveSchemaToDb } from "./jira-schema.js";
 import type {
   ChangelogEntry,
   CreatedTicket,
-  FieldResolvable,
+  JiraAttachment,
   JiraErrorResponse,
-  JiraFieldSchema,
   JiraIssueDetail,
   JiraSchema,
   JiraTicketInput,
@@ -25,7 +26,9 @@ import type {
 } from "./jira-types.js";
 
 export * from "./adf.js";
+export * from "./jira-attachments.js";
 export * from "./jira-auth.js";
+export * from "./jira-fields.js";
 export * from "./jira-schema.js";
 export * from "./jira-types.js";
 
@@ -106,7 +109,7 @@ export class JiraClient {
   async getIssue(issueKey: string): Promise<JiraIssueDetail> {
     validateIssueKey(issueKey);
     const base =
-      "summary,description,issuetype,priority,status,labels,components,parent,assignee,reporter,created,updated,comment";
+      "summary,description,issuetype,priority,status,labels,components,parent,assignee,reporter,created,updated,comment,attachment";
     const spFieldId = this.resolveFieldId("Story Points");
     const fieldList = spFieldId ? `${base},${spFieldId}` : base;
     const raw = await this.request<RawIssueResponse>(
@@ -136,8 +139,25 @@ export class JiraClient {
           created: c.created,
           body: adfToText(c.body),
         })) || [],
+      attachments: (f.attachment ?? []).map(mapAttachment),
       url: `${this.baseUrl}/browse/${encodeURIComponent(raw.key)}`,
     };
+  }
+
+  /**
+   * Upload one or more attachments to an issue.
+   *
+   * Delegates to `uploadAttachments` in jira-attachments.ts.
+   */
+  async addAttachment(issueKey: string, files: AttachmentUpload[]): Promise<JiraAttachment[]> {
+    validateIssueKey(issueKey);
+    return uploadAttachments({
+      baseUrl: this.baseUrl,
+      headers: this.headers,
+      issueKey,
+      files,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+    });
   }
 
   async updateIssue(input: JiraTicketUpdate): Promise<void> {
@@ -252,6 +272,12 @@ export class JiraClient {
   async linkIssues(inwardKey: string, outwardKey: string, linkType: string) {
     return agile.linkIssues(this.req, inwardKey, outwardKey, linkType);
   }
+  async addRemoteLink(
+    issueKey: string,
+    link: { url: string; title: string; summary?: string; relationship?: string; iconUrl?: string; globalId?: string },
+  ): Promise<{ id: number }> {
+    return agile.addRemoteLink(this.req, issueKey, link);
+  }
   async removeIssueLink(linkId: string) {
     return agile.removeIssueLink(this.req, linkId);
   }
@@ -299,90 +325,26 @@ export class JiraClient {
     return (await this.searchIssues(`"Epic Link" = ${epicKey} OR parent = ${epicKey}`)).issues;
   }
 
-  // ── Schema-driven field resolution ──
+  // ── Schema-driven field resolution (delegates to jira-fields.ts) ──
 
-  private resolveCustomFields(fields: Record<string, unknown>, input: FieldResolvable, issueType: string): void {
-    if (input.storyPoints != null) {
-      const id = this.resolveFieldId("Story Points", issueType);
-      fields[id || "story_points"] = input.storyPoints;
-    }
-    if (input.components?.length) {
-      const allowed = this.findFieldSchema("components", issueType)?.allowedValues || [];
-      fields.components = input.components.map((name) => {
-        const match = allowed.find((v) => v.name.toLowerCase() === name.toLowerCase());
-        return match ? { id: match.id } : { name };
-      });
-    }
-    if (input.namedFields) this.resolveNamedFields(fields, input.namedFields, issueType);
-  }
-
-  private resolveNamedFields(
+  private resolveCustomFields(
     fields: Record<string, unknown>,
-    namedFields: Record<string, string | null>,
+    input: Parameters<typeof resolveCustomFields>[2],
     issueType: string,
   ): void {
-    for (const [fieldName, valueName] of Object.entries(namedFields)) {
-      const fs = this.findFieldSchema(fieldName, issueType);
-      if (!fs) continue;
-      if (valueName === null) {
-        fields[fs.id] = null;
-        continue;
-      }
-      if (fs.allowedValues?.length) {
-        const match = fs.allowedValues.find((v) => v.name.toLowerCase().includes(valueName.toLowerCase()));
-        if (match) fields[fs.id] = { id: match.id };
-      } else {
-        fields[fs.id] = valueName;
-      }
-    }
+    resolveCustomFields(this.schema, fields, input, issueType);
   }
 
   private resolveFieldId(fieldName: string, issueType?: string): string | null {
-    if (!this.schema) return null;
-    const types = issueType ? this.schema.issueTypes.filter((t) => t.name === issueType) : this.schema.issueTypes;
-    for (const t of types) {
-      const field = t.fields.find((f) => f.name === fieldName);
-      if (field) return field.id;
-    }
-    return null;
-  }
-
-  private findFieldSchema(fieldName: string, issueType: string): JiraFieldSchema | null {
-    if (!this.schema) return null;
-    const ts = this.schema.issueTypes.find((t) => t.name === issueType);
-    return ts?.fields.find((f) => f.name === fieldName || f.id === fieldName) || null;
+    return resolveFieldId(this.schema, fieldName, issueType);
   }
 
   private autoFillRequired(fields: Record<string, unknown>, issueType: string): void {
-    if (!this.schema) return;
-    const ts = this.schema.issueTypes.find((t) => t.name === issueType);
-    if (!ts) return;
-    const SYSTEM = new Set(["project", "issuetype", "summary", "parent", "issueType"]);
-    for (const field of ts.fields) {
-      if (!field.required || SYSTEM.has(field.system || field.id) || fields[field.id] !== undefined) continue;
-      if (field.allowedValues?.length) fields[field.id] = { id: field.allowedValues[0]?.id };
-    }
-    if (this.schema.board?.teamId && this.schema.board.teamFieldId) {
-      if (fields[this.schema.board.teamFieldId] === undefined) {
-        fields[this.schema.board.teamFieldId] = this.schema.board.teamId;
-      }
-    }
+    autoFillRequired(this.schema, fields, issueType);
   }
 
   getFieldGuide(issueType: string): string | null {
-    if (!this.schema) return null;
-    const ts = this.schema.issueTypes.find((t) => t.name === issueType);
-    if (!ts) return null;
-    const lines = [`## Fields for ${issueType}\n`];
-    for (const f of ts.fields) {
-      let line = `- **${f.name}** (${f.id}) [${f.type}] — ${f.required ? "**REQUIRED**" : "optional"}`;
-      if (f.allowedValues?.length) {
-        const vals = f.allowedValues.map((v) => `\`${v.name}\``).join(", ");
-        line += `\n  Values: ${vals}`;
-      }
-      lines.push(line);
-    }
-    return lines.join("\n");
+    return buildFieldGuide(this.schema, issueType);
   }
 
   get project(): string {

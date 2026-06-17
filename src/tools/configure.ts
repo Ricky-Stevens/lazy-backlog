@@ -1,13 +1,17 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { adfToText } from "../lib/adf.js";
+import { DOWNLOAD_DIR_CONFIG_KEY } from "../lib/attachments.js";
 import { errorResponse, resolveConfig, textResponse } from "../lib/config.js";
-import { ConfluenceClient } from "../lib/confluence.js";
 import type { KnowledgeBase } from "../lib/db.js";
-import { Spider } from "../lib/indexer.js";
 import { JiraClient, type JiraSchema } from "../lib/jira.js";
 import { analyzeBacklog } from "../lib/team-rules.js";
-import { learnTeamConventions } from "./configure-helpers.js";
+import { formatSchemaResult, learnTeamConventions, spiderSpaces } from "./configure-helpers.js";
+import { validateDownloadDir } from "./configure-paths.js";
+
+// Barrel re-export (PAG-6 helper) preserves the prior import path.
+export { FORBIDDEN_DOWNLOAD_DIR_PREFIXES, validateDownloadDir } from "./configure-paths.js";
+
 import { buildSuggestions } from "./suggestions.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -19,54 +23,7 @@ type ToolResponse = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function formatSchemaResult(schema: JiraSchema): string {
-  const types = schema.issueTypes.map((t) => t.name).join(", ");
-  const fields = schema.issueTypes.reduce((n, t) => n + t.fields.length, 0);
-  const lines = [
-    `${schema.projectName} (${schema.projectKey}):`,
-    `- ${schema.issueTypes.length} issue types: ${types}`,
-    `- ${fields} fields mapped`,
-    `- ${schema.priorities.length} priorities`,
-  ];
-  if (schema.board) {
-    lines.push(`- Board: ${schema.board.name} (${schema.board.type})`);
-    if (schema.board.teamName) lines.push(`- Team: ${schema.board.teamName}`);
-  }
-  return lines.join("\n");
-}
-
-async function spiderSpaces(
-  config: ReturnType<typeof resolveConfig>,
-  kb: KnowledgeBase,
-  spaceKeys: string[],
-  maxDepth: number,
-): Promise<string> {
-  const client = new ConfluenceClient(config);
-  const spider = new Spider(client, kb);
-  let indexed = 0;
-  let unchanged = 0;
-  let skipped = 0;
-  const errors: string[] = [];
-
-  for (const spaceKey of spaceKeys) {
-    const r = await spider.crawl({ spaceKey, maxDepth, maxConcurrency: 5, includeLabels: [], excludeLabels: [] });
-    indexed += r.indexed;
-    unchanged += r.unchanged;
-    skipped += r.skipped;
-    errors.push(...r.errors);
-  }
-
-  const stats = kb.getStats();
-  const lines = [
-    `Indexed: ${indexed} | Unchanged: ${unchanged} | Skipped: ${skipped}`,
-    `KB total: ${stats.total} pages`,
-    `Types: ${Object.entries(stats.byType)
-      .map(([k, v]) => `${k}:${v}`)
-      .join(" ")}`,
-  ];
-  if (errors.length > 0) lines.push(`Errors: ${errors.length} (first: ${errors[0]})`);
-  return lines.join("\n");
-}
+// `formatSchemaResult` / `spiderSpaces` moved to configure-helpers.ts.
 
 // ── Action Handlers ──────────────────────────────────────────────────────────
 
@@ -76,6 +33,7 @@ function handleSet(
     jiraBoardId?: string;
     confluenceSpaces?: string[];
     rootPageIds?: string[];
+    downloadDir?: string;
   },
   kb: KnowledgeBase,
 ): ToolResponse {
@@ -100,13 +58,24 @@ function handleSet(
   if (params.confluenceSpaces !== undefined) current.confluenceSpaces = params.confluenceSpaces;
   if (params.rootPageIds !== undefined) current.rootPageIds = params.rootPageIds;
 
+  // PAG-6: validate downloadDir BEFORE writing anything (only user-controlled
+  // disk-write location). Store separately from `atlassian` since it's reused
+  // by both Jira + Confluence flows.
+  if (params.downloadDir !== undefined) {
+    const reason = validateDownloadDir(params.downloadDir);
+    if (reason !== null) return errorResponse(reason);
+  }
   kb.setConfig("atlassian", JSON.stringify(current));
+  if (params.downloadDir !== undefined) {
+    kb.setConfig(DOWNLOAD_DIR_CONFIG_KEY, params.downloadDir);
+  }
 
   const parts: string[] = [];
   if (typeof current.jiraProjectKey === "string") parts.push(`Project: ${current.jiraProjectKey}`);
   if (typeof current.jiraBoardId === "string") parts.push(`Board: ${current.jiraBoardId}`);
   const spaces = (current.confluenceSpaces as string[])?.join(", ");
   if (spaces) parts.push(`Spaces: ${spaces}`);
+  if (params.downloadDir !== undefined) parts.push(`Download Dir: ${params.downloadDir}`);
 
   return textResponse(`Saved. ${parts.join(" | ") || "No settings changed."}`);
 }
@@ -129,6 +98,7 @@ function handleGet(kb: KnowledgeBase): ToolResponse {
     return value ? `${value} (SQLite)` : "(not set)";
   };
 
+  const downloadDir = kb.getConfig(DOWNLOAD_DIR_CONFIG_KEY);
   lines.push(
     `**Site URL:** ${maskedUrl} (env: ATLASSIAN_SITE_URL)`,
     `**Email:** ${config.email} (env: ATLASSIAN_EMAIL)`,
@@ -136,6 +106,7 @@ function handleGet(kb: KnowledgeBase): ToolResponse {
     `**Jira Board ID:** ${envOrDb("JIRA_BOARD_ID", config.jiraBoardId)}`,
     `**Confluence Spaces:** ${config.confluenceSpaces.length > 0 ? config.confluenceSpaces.join(", ") : "(none)"}${process.env.CONFLUENCE_SPACES ? " (env: CONFLUENCE_SPACES)" : " (SQLite)"}`,
     `**Root Page IDs:** ${config.rootPageIds.length > 0 ? config.rootPageIds.join(", ") : "(none)"}`,
+    `**Download Dir:** ${downloadDir ?? "(default: $HOME/lazy-backlog-downloads)"}`,
   );
 
   const schema = JiraClient.loadSchemaFromDb(kb);
@@ -339,6 +310,12 @@ export function registerConfigureTool(server: McpServer, getKb: () => KnowledgeB
           .optional()
           .describe("[set] Confluence space keys to index, e.g. ['ENG','PM']"),
         rootPageIds: z.array(z.string()).optional().describe("[set] Specific Confluence page IDs to spider from"),
+        downloadDir: z
+          .string()
+          .optional()
+          .describe(
+            "[set] Absolute path used for safe attachment downloads (issues get / knowledge get-page with download=true). Files are sanitised before write and capped at 10MB.",
+          ),
         projectKey: z
           .string()
           .optional()

@@ -1,7 +1,16 @@
 import type { ProjectConfig } from "../config/schema.js";
+import {
+  buildConfluenceWebUrl,
+  createPage as createPageHelper,
+  getPageSpaceKey as getPageSpaceKeyHelper,
+  getPageVersion as getPageVersionHelper,
+  type PageWriteResult,
+  updatePage as updatePageHelper,
+} from "./confluence-write.js";
 import { htmlToMarkdown, Semaphore } from "./html-to-markdown.js";
 import { fetchWithRetry } from "./http-utils.js";
 
+export type { PageWriteResult } from "./confluence-write.js";
 export * from "./html-to-markdown.js";
 
 // ── Confluence API response types ──────────────────────────────────────────
@@ -32,6 +41,17 @@ interface ApiLabel {
   name: string;
 }
 
+interface ApiAttachment {
+  id: string;
+  title?: string;
+  fileSize?: number;
+  mediaType?: string;
+  downloadLink?: string;
+  webuiLink?: string;
+  version?: { createdAt?: string };
+  _links?: { download?: string; webui?: string };
+}
+
 interface PaginatedResponse<T> {
   results: T[];
   _links?: { next?: string };
@@ -59,6 +79,7 @@ export interface ConfluencePage {
   createdAt?: string;
   updatedAt?: string;
   url?: string;
+  attachments?: ConfluenceAttachment[];
 }
 
 export interface ConfluenceSpace {
@@ -66,6 +87,20 @@ export interface ConfluenceSpace {
   key: string;
   name: string;
   type: string;
+}
+
+export interface ConfluenceAttachment {
+  id: string;
+  filename: string;
+  mediaType: string;
+  size: number;
+  /** Absolute download URL on the Confluence site. */
+  url: string;
+  /** Optional human-friendly webui link. */
+  webuiUrl?: string;
+  /** True when mediaType indicates an image. */
+  isImage: boolean;
+  createdAt?: string;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -123,6 +158,20 @@ export class ConfluenceClient {
     }
   }
 
+  /** Build the write context handed to standalone write helpers. */
+  private writeCtx() {
+    return {
+      baseUrl: this.baseUrl,
+      headers: this.headers,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      acquire: () => this.semaphore.acquire(),
+      release: () => this.semaphore.release(),
+    };
+  }
+
+  /** Read function bound to this client, used by the write helpers. */
+  private readFn = <T>(path: string, params?: Record<string, string>): Promise<T> => this.request<T>(path, params);
+
   private async *paginateIter<T>(path: string, params?: Record<string, string>): AsyncGenerator<T> {
     let currentPath = path;
     let currentParams = params;
@@ -168,18 +217,74 @@ export class ConfluenceClient {
     return raw.map((p) => this.mapPage(p));
   }
 
-  /** Fetch a single page with body + labels in parallel. 2 requests, 1 round-trip. */
+  /**
+   * Fetch a single page with body, labels, and attachment manifest in parallel.
+   *
+   * The attachment manifest is used to rewrite `<ri:attachment>` image
+   * references to real download URLs before the storage HTML is converted to
+   * markdown. Attachment errors are non-fatal — the page still returns.
+   */
   async getPageFull(pageId: string): Promise<ConfluencePage> {
-    const [raw, labelResult] = await Promise.all([
+    const [rawResult, labelResult, attachmentResult] = await Promise.allSettled([
       this.request<ApiPage>(`/wiki/api/v2/pages/${pageId}`, {
         "body-format": "storage",
       }),
       this.request<PaginatedResponse<ApiLabel>>(`/wiki/api/v2/pages/${pageId}/labels`, { limit: "50" }),
+      this.fetchAttachments(pageId),
     ]);
 
-    const page = this.mapPage(raw);
-    page.labels = labelResult.results.map((l) => l.name);
+    if (rawResult.status === "rejected") {
+      throw rawResult.reason;
+    }
+    const raw = rawResult.value;
+    const labels = labelResult.status === "fulfilled" ? labelResult.value.results.map((l) => l.name) : [];
+    const attachments = attachmentResult.status === "fulfilled" ? attachmentResult.value : [];
+
+    // Build filename → URL manifest for image resolution.
+    const attachmentUrls: Record<string, string> = {};
+    for (const att of attachments) {
+      attachmentUrls[att.filename] = att.url;
+    }
+
+    const page = this.mapPage(raw, attachmentUrls);
+    page.labels = labels;
+    page.attachments = attachments;
     return page;
+  }
+
+  /** Fetch the attachment manifest for a page. */
+  async getPageAttachments(pageId: string): Promise<ConfluenceAttachment[]> {
+    return this.fetchAttachments(pageId);
+  }
+
+  private async fetchAttachments(pageId: string): Promise<ConfluenceAttachment[]> {
+    const raw = await this.paginate<ApiAttachment>(`/wiki/api/v2/pages/${pageId}/attachments`, {
+      limit: "50",
+    });
+    return raw.map((a) => this.mapAttachment(a));
+  }
+
+  private mapAttachment(raw: ApiAttachment): ConfluenceAttachment {
+    const filename = raw.title ?? raw.id;
+    const mediaType = raw.mediaType ?? "application/octet-stream";
+    const downloadPath = raw.downloadLink ?? raw._links?.download ?? "";
+    const webuiPath = raw.webuiLink ?? raw._links?.webui ?? undefined;
+    // PUB-7: webui paths may already include /wiki — use the shared normaliser
+    // so we never double-prepend it.
+    const url = downloadPath.startsWith("http")
+      ? downloadPath
+      : (buildConfluenceWebUrl(this.baseUrl, downloadPath) ?? `${this.baseUrl}/wiki`);
+    const webuiUrl = buildConfluenceWebUrl(this.baseUrl, webuiPath);
+    return {
+      id: String(raw.id),
+      filename,
+      mediaType,
+      size: raw.fileSize ?? 0,
+      url,
+      webuiUrl,
+      isImage: mediaType.startsWith("image/"),
+      createdAt: raw.version?.createdAt,
+    };
   }
 
   /** Fetch direct child pages of a given page. */
@@ -208,25 +313,85 @@ export class ConfluenceClient {
         spaceKey: c.space?.key || "",
         body: htmlToMarkdown(c.body?.storage?.value || ""),
         labels: (c.metadata?.labels?.results || []).map((l) => l.name),
-        url: c._links?.webui ? `${this.baseUrl}/wiki${c._links.webui}` : undefined,
+        url: buildConfluenceWebUrl(this.baseUrl, c._links?.webui),
         status: c.status || "current",
       };
     });
   }
 
-  private mapPage(raw: ApiPage): ConfluencePage {
+  /** Current version number of a page — required for `updatePage`. */
+  async getPageVersion(pageId: string): Promise<number> {
+    return getPageVersionHelper(this.readFn, pageId);
+  }
+
+  /**
+   * Resolve the space key of an existing page. Used by `confluence publish`
+   * to enforce the `confluenceSpaces` allow-list before any update write.
+   */
+  async getPageSpaceKey(pageId: string): Promise<string> {
+    return getPageSpaceKeyHelper(this.readFn, pageId);
+  }
+
+  /**
+   * One-shot fetch of page metadata: space key, title, and version. Used by
+   * the publish flow (PUB-13) so a single update doesn't issue separate GETs
+   * for the scope check, version probe, and title backfill.
+   */
+  async getPageMeta(pageId: string): Promise<{ spaceKey: string; title: string; version: number }> {
+    const page = await this.request<{
+      title?: string;
+      spaceId?: string | number;
+      version?: { number?: number };
+    }>(`/wiki/api/v2/pages/${pageId}`);
+    const version = page.version?.number;
+    if (typeof version !== "number" || !Number.isFinite(version)) {
+      throw new Error(`Confluence page ${pageId} returned no version number`);
+    }
+    const title = page.title ?? "";
+    const spaceId = page.spaceId != null ? String(page.spaceId) : "";
+    if (!spaceId) throw new Error(`Confluence page ${pageId} returned no spaceId`);
+    const spaceResp = await this.request<{ results: Array<{ id: string | number; key?: string }> }>(
+      "/wiki/api/v2/spaces",
+      { ids: spaceId, limit: "1" },
+    );
+    const spaceKey = spaceResp.results[0]?.key;
+    if (!spaceKey) throw new Error(`Confluence space with id ${spaceId} not found (page ${pageId})`);
+    return { spaceKey, title, version };
+  }
+
+  /** Create a new Confluence page. `body` must be storage-format XHTML. */
+  async createPage(input: {
+    spaceKey: string;
+    title: string;
+    body: string;
+    parentId?: string;
+  }): Promise<PageWriteResult> {
+    return createPageHelper(this.writeCtx(), this.readFn, input);
+  }
+
+  /**
+   * Update an existing page. Requires the current version number. A 409 is
+   * surfaced as an explicit error — never silently clobbered.
+   */
+  async updatePage(input: { pageId: string; title?: string; body: string; version: number }): Promise<PageWriteResult> {
+    return updatePageHelper(this.writeCtx(), this.readFn, input);
+  }
+
+  private mapPage(raw: ApiPage, attachmentUrls?: Record<string, string>): ConfluencePage {
     return {
       id: String(raw.id),
       title: raw.title || "",
       spaceId: raw.spaceId || "",
       parentId: raw.parentId ? String(raw.parentId) : undefined,
       status: raw.status || "current",
-      body: raw.body?.storage?.value ? htmlToMarkdown(raw.body.storage.value) : undefined,
+      body: raw.body?.storage?.value
+        ? htmlToMarkdown(raw.body.storage.value, { baseUrl: this.baseUrl, attachmentUrls })
+        : undefined,
       labels: [],
       authorId: raw.authorId,
       createdAt: raw.createdAt,
       updatedAt: raw.version?.createdAt || raw.createdAt,
-      url: raw._links?.webui ? `${this.baseUrl}/wiki${raw._links.webui}` : undefined,
+      url: buildConfluenceWebUrl(this.baseUrl, raw._links?.webui),
     };
   }
 }

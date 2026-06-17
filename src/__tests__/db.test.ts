@@ -21,6 +21,7 @@ function makePage(overrides: Partial<IndexedPage> = {}): IndexedPage {
     updated_at: overrides.updated_at ?? "2025-06-01T00:00:00Z",
     indexed_at: overrides.indexed_at ?? new Date().toISOString(),
     source: overrides.source ?? "confluence",
+    content_hash: overrides.content_hash ?? null,
   };
 }
 
@@ -179,6 +180,49 @@ describe("rebuildFts", () => {
     kb.rebuildFts();
     const results = kb.search("kubernetes");
     expect(results).toHaveLength(1);
+  });
+
+  it("rebuilds chunk FTS too (DB-7)", () => {
+    // Add a page + chunk, rebuild FTS, then prove chunk search still hits.
+    kb.upsertPage(makePage({ id: "1", content: "irrelevant" }));
+    kb.upsertChunks("1", [
+      {
+        breadcrumb: "Top",
+        heading: "Section",
+        depth: 1,
+        content: "widgets are red",
+        index: 0,
+      },
+    ]);
+    kb.rebuildFts();
+    const results = kb.searchChunks("widgets");
+    expect(results.length).toBeGreaterThan(0);
+  });
+});
+
+// ── DB-5 — fresh DB schema is canonical (no ALTER TABLE on first open) ────
+
+describe("initSchema canonical shape (DB-5)", () => {
+  it("creates the `source` column on a fresh DB without relying on migrateSchema", () => {
+    // The exported KnowledgeBase already runs both initSchema + migrateSchema
+    // at construction. We assert directly against pragma table_info that a
+    // freshly-created DB has the `source` column — i.e. the canonical schema
+    // includes it, not just the migration.
+    const cols = (kb as unknown as { db: { pragma: (s: string) => Array<{ name: string }> } }).db.pragma(
+      "table_info(pages)",
+    );
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("source");
+    expect(names).toContain("content_hash");
+  });
+
+  it("creates idx_pages_source on a fresh DB", () => {
+    const indexes = (kb as unknown as { db: { pragma: (s: string) => Array<{ name: string }> } }).db.pragma(
+      "index_list(pages)",
+    );
+    const names = indexes.map((c) => c.name);
+    expect(names).toContain("idx_pages_source");
+    expect(names).toContain("idx_pages_source_key");
   });
 });
 

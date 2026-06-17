@@ -96,6 +96,7 @@ describe("registerBugsTool", () => {
       updated: (overrides.updated as string) ?? "2025-06-01",
       url: `https://test.atlassian.net/browse/${key}`,
       comments: [],
+      attachments: [],
     };
   }
 

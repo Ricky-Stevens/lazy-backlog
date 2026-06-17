@@ -1,5 +1,12 @@
 import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
+import type { JiraAttachment } from "../lib/jira-types.js";
+import {
+  buildJiraDownloadContext,
+  type DownloadContext,
+  humanReadableSize,
+  runAttachmentDownloads,
+} from "./issues-get-download.js";
 import { buildSuggestions } from "./suggestions.js";
 
 // ---------------------------------------------------------------------------
@@ -24,6 +31,7 @@ interface IssueDetail {
   url: string;
   description?: string;
   comments: Array<{ author: string; created: string; body: string }>;
+  attachments?: JiraAttachment[];
 }
 
 interface DevStatus {
@@ -96,6 +104,31 @@ function formatComments(comments: Array<{ author: string; created: string; body:
   return out;
 }
 
+/**
+ * Render the attachment manifest for a ticket. Image attachments are emitted
+ * as markdown image syntax (`![filename](url)`) so MCP clients that render
+ * inline images can show them; non-image attachments are listed in a table
+ * with filename, mime type, size, author, created date, and download URL.
+ */
+export function formatAttachments(attachments: JiraAttachment[] | undefined): string {
+  if (!attachments || attachments.length === 0) return "";
+  let out = `\n## Attachments (${attachments.length})\n\n`;
+  out += `| Filename | Type | Size | Author | Created |\n`;
+  out += `|----------|------|------|--------|---------|\n`;
+  for (const a of attachments) {
+    const flag = a.isImage ? " (image)" : "";
+    out += `| [${a.filename}](${a.url})${flag} | ${a.mimeType} | ${humanReadableSize(a.size)} | ${a.author ?? "?"} | ${a.created} |\n`;
+  }
+  const images = attachments.filter((a) => a.isImage);
+  if (images.length > 0) {
+    out += `\n### Image previews\n`;
+    for (const img of images) {
+      out += `![${img.filename}](${img.url})\n`;
+    }
+  }
+  return out;
+}
+
 async function fetchIssueLinks(
   jira: unknown,
   key: string,
@@ -116,6 +149,7 @@ async function fetchIssueLinks(
 async function handleSingleIssue(
   jira: { getIssue(key: string): Promise<IssueDetail>; getDevStatus(id: string): Promise<DevStatus> },
   key: string,
+  downloadCtx: DownloadContext | null,
 ) {
   const issue = await jira.getIssue(key);
   const dev = await jira.getDevStatus(issue.id);
@@ -126,9 +160,22 @@ async function handleSingleIssue(
   if (issue.description) out += `\n## Description\n${issue.description}\n`;
   out += formatIssueLinks(links);
   out += formatComments(issue.comments);
+  out += formatAttachments(issue.attachments);
+
+  let downloadSection = "";
+  if (downloadCtx && issue.attachments && issue.attachments.length > 0) {
+    downloadSection = await runAttachmentDownloads(issue.attachments, downloadCtx);
+    out += downloadSection;
+  }
+
   const hasMissingFields =
     !issue.description || !issue.assignee || issue.labels.length === 0 || issue.components.length === 0;
-  const suggestions = buildSuggestions("issues", "get", { hasMissingFields });
+  const hasAttachments = (issue.attachments?.length ?? 0) > 0;
+  const suggestions = buildSuggestions("issues", "get", {
+    hasMissingFields,
+    hasAttachments,
+    downloaded: downloadSection.length > 0,
+  });
   return textResponse(out + suggestions);
 }
 
@@ -220,6 +267,10 @@ export async function handleGetAction(
   params: {
     issueKey?: string;
     issueKeys?: string[];
+    /** When true, download attachments to the configured directory. */
+    download?: boolean;
+    /** Optional filter: only download attachments matching these ids/filenames. */
+    attachmentIds?: string[];
   },
   kb: KnowledgeBase,
 ) {
@@ -227,15 +278,28 @@ export async function handleGetAction(
   if (keys.length === 0) return errorResponse("issueKey or issueKeys is required for 'get' action.");
 
   try {
-    const { jira } = buildJiraClient(kb);
+    const { jira, config } = buildJiraClient(kb);
+    let downloadCtx: DownloadContext | null = null;
+    if (params.download) {
+      if (keys.length !== 1) {
+        return errorResponse("download is only supported when fetching a single issue (issueKey, not issueKeys).");
+      }
+      // ATT-1: the download directory is sourced exclusively from the stored
+      // config — no per-call override. The roadmap explicitly forbids writing
+      // outside the configured directory.
+      downloadCtx = buildJiraDownloadContext(kb, config, params.attachmentIds);
+    }
+
     if (keys.length === 1) {
-      return await handleSingleIssue(jira as Parameters<typeof handleSingleIssue>[0], keys[0] as string);
+      return await handleSingleIssue(jira as Parameters<typeof handleSingleIssue>[0], keys[0] as string, downloadCtx);
     }
     return await handleBulkFetch(jira as Parameters<typeof handleBulkFetch>[0], keys);
   } catch (err: unknown) {
     return errorResponse(`Failed to fetch issues: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+
+export type { JiraAttachment };
 
 // ---------------------------------------------------------------------------
 // Search helpers
