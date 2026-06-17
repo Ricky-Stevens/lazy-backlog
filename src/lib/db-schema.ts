@@ -1,4 +1,21 @@
-import type { SqliteDatabase, Statement } from "./sqlite.js";
+import { initSpecLinksSchema } from "./db-schema-spec-links.js";
+import type { SqliteDatabase } from "./sqlite.js";
+
+// Re-export the split helpers so callers can keep importing from db-schema.js
+// without knowing about the split.
+export {
+  type InsightsStatements,
+  prepareInsightsStatements,
+} from "./db-schema-insights.js";
+export {
+  initSpecLinksSchema,
+  prepareSpecLinkStatements,
+  type SpecLinkStatements,
+} from "./db-schema-spec-links.js";
+// PreparedStatements + prepareStatements live in db-schema-statements.ts so
+// db-schema.ts stays under the 400-line cap. Re-exported here to preserve all
+// existing import paths.
+export { type PreparedStatements, prepareStatements } from "./db-schema-statements.js";
 
 /** Configure SQLite PRAGMAs for performance. */
 export function configurePragmas(db: SqliteDatabase): void {
@@ -25,7 +42,9 @@ export function initSchema(db: SqliteDatabase): void {
       author_id TEXT,
       created_at TEXT,
       updated_at TEXT,
-      indexed_at TEXT NOT NULL
+      indexed_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'confluence',
+      content_hash TEXT
     ) STRICT
   `);
 
@@ -33,6 +52,11 @@ export function initSchema(db: SqliteDatabase): void {
   db.exec("CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(page_type)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_pages_space_type ON pages(space_key, page_type)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_pages_updated ON pages(updated_at)");
+  // DB-5: `source` indexes belong in the canonical schema so a fresh DB
+  // doesn't have to ALTER TABLE itself on first open. migrateSchema() still
+  // covers legacy DBs that pre-date the column (idempotent via hasSource).
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source ON pages(source)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source_key ON pages(source, space_key)");
 
   // ── Chunks table: section-level content with heading breadcrumbs ──
   db.exec(`
@@ -201,9 +225,12 @@ export function initSchema(db: SqliteDatabase): void {
       PRIMARY KEY (category, insight_key)
     ) STRICT
   `);
+
+  // ── Spec ↔ Epic links (Stage D) — schema lives in db-schema-spec-links.ts ──
+  initSpecLinksSchema(db);
 }
 
-/** Migrate existing DBs: add `source` column to pages if missing. */
+/** Migrate existing DBs: add `source` and `content_hash` columns to pages if missing. */
 export function migrateSchema(db: SqliteDatabase): void {
   const columns = db.pragma("table_info(pages)") as Array<{ name: string }>;
   const hasSource = columns.some((c) => c.name === "source");
@@ -212,192 +239,27 @@ export function migrateSchema(db: SqliteDatabase): void {
     db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source ON pages(source)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_pages_source_key ON pages(source, space_key)");
   }
+
+  // E1 (Stage E) — content-hash incremental sync. The hash fingerprints content
+  // + labels + title (+ attachments, see DB-2) so label-only, content-only, or
+  // attachment-only changes are re-indexed even when `updated_at` was not
+  // bumped by the source. Nullable to keep the migration additive: existing
+  // rows have NULL until the next crawl re-hashes them. DB-6: re-indexing of
+  // legacy NULL-hash rows is enforced explicitly by `KnowledgeBase.needsReindex`
+  // (see `db.ts`: `if (row.content_hash === null) return true;`) — the NULL
+  // value does NOT participate in the `!==` comparison; treating it as
+  // must-re-index is a deliberate special case so the first post-migration
+  // crawl backfills `content_hash` for every legacy row.
+  const hasContentHash = columns.some((c) => c.name === "content_hash");
+  if (!hasContentHash) {
+    db.exec("ALTER TABLE pages ADD COLUMN content_hash TEXT");
+  }
+
+  // epic_spec_links is created by initSchema() (CREATE IF NOT EXISTS), so no
+  // explicit migration is needed for fresh installs. The IF NOT EXISTS guard
+  // covers older DBs too — calling initSchema() at startup is enough.
 }
 
-/** Map of all pre-prepared CRUD statements. */
-export interface PreparedStatements {
-  upsert: Statement;
-  getById: Statement;
-  getByType: Statement;
-  getByTypeAndSpace: Statement;
-  summariesByType: Statement;
-  summariesByTypeAndSpace: Statement;
-  summariesBySource: Statement;
-  stats: Statement;
-  getConfig: Statement;
-  setConfig: Statement;
-  deleteBySpace: Statement;
-  deleteBySource: Statement;
-  countBySpaceKey: Statement;
-  countBySource: Statement;
-  getUpdatedAt: Statement;
-  insertChunk: Statement;
-  deleteChunksByPage: Statement;
-  getChunksByPage: Statement;
-  upsertSprint: Statement;
-  getSprintById: Statement;
-  getSprintsByBoard: Statement;
-  getSprintsByBoardAndState: Statement;
-  insertChangelog: Statement;
-  getChangelogByIssue: Statement;
-  getChangelogByIssueAndField: Statement;
-  deleteChangelogByIssue: Statement;
-  getStalePages: Statement;
-  getStalePagesFiltered: Statement;
-  getStalePagesTyped: Statement;
-  getStalePagesAll: Statement;
-  getRecentlyIndexed: Statement;
-  getRecentlyIndexedBySource: Statement;
-  upsertTeamRule: Statement;
-  getAllTeamRules: Statement;
-  getTeamRulesByCategory: Statement;
-  getTeamRulesByCategoryAndType: Statement;
-  getTeamRulesByIssueType: Statement;
-  deleteAllTeamRules: Statement;
-  insertAnalysis: Statement;
-  getLatestAnalysis: Statement;
-  upsertInsight: Statement;
-  getInsightsByCategory: Statement;
-  getAllInsights: Statement;
-  deleteInsightsByCategory: Statement;
-  deleteAllInsights: Statement;
-}
-
-/** Pre-prepare all CRUD statements to avoid dynamic SQL. */
-export function prepareStatements(db: SqliteDatabase): PreparedStatements {
-  return {
-    upsert: db.prepare(
-      `INSERT INTO pages (id, space_key, title, url, content, page_type, labels, parent_id, author_id, created_at, updated_at, indexed_at, source)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         space_key=excluded.space_key, title=excluded.title, url=excluded.url,
-         content=excluded.content, page_type=excluded.page_type, labels=excluded.labels,
-         parent_id=excluded.parent_id, author_id=excluded.author_id,
-         created_at=excluded.created_at, updated_at=excluded.updated_at,
-         indexed_at=excluded.indexed_at, source=excluded.source`,
-    ),
-    getById: db.prepare("SELECT * FROM pages WHERE id = ?"),
-    getByType: db.prepare("SELECT * FROM pages WHERE page_type = ? ORDER BY title"),
-    getByTypeAndSpace: db.prepare("SELECT * FROM pages WHERE page_type = ? AND space_key = ? ORDER BY title"),
-    // Lightweight queries — no content body, just preview
-    summariesByType: db.prepare(
-      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
-       substr(content, 1, 300) as content_preview
-       FROM pages WHERE page_type = ? ORDER BY title`,
-    ),
-    summariesByTypeAndSpace: db.prepare(
-      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
-       substr(content, 1, 300) as content_preview
-       FROM pages WHERE page_type = ? AND space_key = ? ORDER BY title`,
-    ),
-    summariesBySource: db.prepare(
-      `SELECT id, space_key, title, url, page_type, labels, updated_at, source,
-       substr(content, 1, 300) as content_preview
-       FROM pages WHERE source = ? AND page_type = ? ORDER BY title`,
-    ),
-    // Stats in a single query
-    stats: db.prepare(`
-      SELECT
-        'total' as group_type, 'all' as key, COUNT(*) as count FROM pages
-      UNION ALL
-      SELECT 'type', page_type, COUNT(*) FROM pages GROUP BY page_type
-      UNION ALL
-      SELECT 'space', space_key, COUNT(*) FROM pages GROUP BY space_key
-      UNION ALL
-      SELECT 'source', source, COUNT(*) FROM pages GROUP BY source
-      UNION ALL
-      SELECT 'chunks', 'all', COUNT(*) FROM chunks
-    `),
-    getConfig: db.prepare("SELECT value FROM config WHERE key = ?"),
-    setConfig: db.prepare(
-      "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ),
-    deleteBySpace: db.prepare("DELETE FROM pages WHERE space_key = ?"),
-    deleteBySource: db.prepare("DELETE FROM pages WHERE source = ?"),
-    countBySpaceKey: db.prepare("SELECT COUNT(*) as count FROM pages WHERE space_key = ?"),
-    countBySource: db.prepare("SELECT COUNT(*) as count FROM pages WHERE source = ?"),
-    getUpdatedAt: db.prepare("SELECT id, updated_at FROM pages WHERE id = ?"),
-    // Chunk statements
-    insertChunk: db.prepare(
-      `INSERT INTO chunks (page_id, breadcrumb, heading, depth, content, chunk_index)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    deleteChunksByPage: db.prepare("DELETE FROM chunks WHERE page_id = ?"),
-    getChunksByPage: db.prepare("SELECT * FROM chunks WHERE page_id = ? ORDER BY chunk_index"),
-    // Sprint statements
-    upsertSprint: db.prepare(
-      `INSERT INTO sprints (id, board_id, name, state, goal, start_date, end_date, complete_date, cached_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         board_id=excluded.board_id, name=excluded.name, state=excluded.state,
-         goal=excluded.goal, start_date=excluded.start_date, end_date=excluded.end_date,
-         complete_date=excluded.complete_date, cached_at=excluded.cached_at`,
-    ),
-    getSprintById: db.prepare("SELECT * FROM sprints WHERE id = ?"),
-    getSprintsByBoard: db.prepare("SELECT * FROM sprints WHERE board_id = ? ORDER BY start_date DESC"),
-    getSprintsByBoardAndState: db.prepare(
-      "SELECT * FROM sprints WHERE board_id = ? AND state = ? ORDER BY start_date DESC",
-    ),
-    // Changelog statements
-    insertChangelog: db.prepare(
-      `INSERT INTO changelogs (id, issue_key, author_name, author_id, created, field, from_value, to_value, cached_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         issue_key=excluded.issue_key, author_name=excluded.author_name, author_id=excluded.author_id,
-         created=excluded.created, field=excluded.field, from_value=excluded.from_value,
-         to_value=excluded.to_value, cached_at=excluded.cached_at`,
-    ),
-    getChangelogByIssue: db.prepare("SELECT * FROM changelogs WHERE issue_key = ? ORDER BY created ASC"),
-    getChangelogByIssueAndField: db.prepare(
-      "SELECT * FROM changelogs WHERE issue_key = ? AND field = ? ORDER BY created ASC",
-    ),
-    deleteChangelogByIssue: db.prepare("DELETE FROM changelogs WHERE issue_key = ?"),
-    // Stale/recent page queries
-    getStalePages: db.prepare("SELECT * FROM pages WHERE updated_at < ? ORDER BY updated_at ASC"),
-    getStalePagesFiltered: db.prepare(
-      "SELECT * FROM pages WHERE updated_at < ? AND space_key = ? ORDER BY updated_at ASC",
-    ),
-    getStalePagesTyped: db.prepare(
-      "SELECT * FROM pages WHERE updated_at < ? AND page_type = ? ORDER BY updated_at ASC",
-    ),
-    getStalePagesAll: db.prepare(
-      "SELECT * FROM pages WHERE updated_at < ? AND page_type = ? AND space_key = ? ORDER BY updated_at ASC",
-    ),
-    getRecentlyIndexed: db.prepare("SELECT * FROM pages WHERE indexed_at > ? ORDER BY indexed_at DESC"),
-    getRecentlyIndexedBySource: db.prepare(
-      "SELECT * FROM pages WHERE indexed_at > ? AND source = ? ORDER BY indexed_at DESC",
-    ),
-    // Team rule statements
-    upsertTeamRule: db.prepare(
-      `INSERT INTO team_rules (category, rule_key, issue_type, rule_value, confidence, sample_size, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(category, rule_key, COALESCE(issue_type, '__all__')) DO UPDATE SET
-         rule_value=excluded.rule_value, confidence=excluded.confidence,
-         sample_size=excluded.sample_size, updated_at=excluded.updated_at`,
-    ),
-    getAllTeamRules: db.prepare("SELECT * FROM team_rules ORDER BY category, rule_key"),
-    getTeamRulesByCategory: db.prepare("SELECT * FROM team_rules WHERE category = ? ORDER BY rule_key"),
-    getTeamRulesByCategoryAndType: db.prepare(
-      "SELECT * FROM team_rules WHERE category = ? AND (issue_type = ? OR issue_type IS NULL) ORDER BY rule_key",
-    ),
-    getTeamRulesByIssueType: db.prepare(
-      "SELECT * FROM team_rules WHERE issue_type = ? OR issue_type IS NULL ORDER BY category, rule_key",
-    ),
-    deleteAllTeamRules: db.prepare("DELETE FROM team_rules"),
-    // Backlog analysis statements
-    insertAnalysis: db.prepare(
-      `INSERT INTO backlog_analysis (project_key, tickets_fetched, tickets_quality_passed, quality_threshold, rules_extracted, jql_used, analyzed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ),
-    getLatestAnalysis: db.prepare("SELECT * FROM backlog_analysis ORDER BY analyzed_at DESC LIMIT 1"),
-    // Team insight statements
-    upsertInsight: db.prepare(
-      `INSERT OR REPLACE INTO team_insights (category, insight_key, data, sample_size, confidence, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))`,
-    ),
-    getInsightsByCategory: db.prepare("SELECT * FROM team_insights WHERE category = ?"),
-    getAllInsights: db.prepare("SELECT * FROM team_insights"),
-    deleteInsightsByCategory: db.prepare("DELETE FROM team_insights WHERE category = ?"),
-    deleteAllInsights: db.prepare("DELETE FROM team_insights"),
-  };
-}
+// Implementations of PreparedStatements / prepareStatements live in
+// db-schema-statements.ts (re-exported above) to keep this file under the
+// 400-line project cap.

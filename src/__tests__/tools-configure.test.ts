@@ -227,6 +227,69 @@ describe("action=set", () => {
     expect(result.content[0]?.text).toContain("Project: BP");
     expect(result.content[0]?.text).toContain("Spaces: ENG, PM");
   });
+
+  // ── PAG-6 — downloadDir validation ───────────────────────────────────────
+
+  it("accepts an absolute downloadDir under /tmp (PAG-6)", async () => {
+    const safeDir = mkdtempSync(join(tmpdir(), "lb-cfg-dl-safe-"));
+    try {
+      const { server, getTool } = createMockServer();
+      registerConfigureTool(server, () => kb);
+      const configure = getTool("configure");
+      const result = await configure({ action: "set", downloadDir: safeDir });
+      expect(result.isError).toBeFalsy();
+      expect(kb.getConfig("downloadDir")).toBe(safeDir);
+    } finally {
+      rmSync(safeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses /etc as downloadDir (PAG-6 — forbidden system root)", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", downloadDir: "/etc/cron.d" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/forbidden/i);
+    // Must not have persisted the bad value.
+    expect(kb.getConfig("downloadDir")).toBeUndefined();
+  });
+
+  it("refuses a relative downloadDir (PAG-6 — absolute path required)", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", downloadDir: "downloads" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/absolute path/i);
+  });
+
+  it("refuses a downloadDir containing '..' segments (PAG-6)", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+    const configure = getTool("configure");
+    const result = await configure({ action: "set", downloadDir: "/tmp/foo/../../etc" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/'\.\.'/);
+  });
+
+  it("does not partially commit other fields when downloadDir is invalid (PAG-6)", async () => {
+    const { server, getTool } = createMockServer();
+    registerConfigureTool(server, () => kb);
+    const configure = getTool("configure");
+    const result = await configure({
+      action: "set",
+      jiraProjectKey: "NEWPROJ",
+      downloadDir: "/etc/cron.d",
+    });
+    expect(result.isError).toBe(true);
+    // jiraProjectKey must NOT have been written.
+    const stored = kb.getConfig("atlassian");
+    if (stored) {
+      const parsed = JSON.parse(stored) as { jiraProjectKey?: string };
+      expect(parsed.jiraProjectKey).not.toBe("NEWPROJ");
+    }
+  });
 });
 
 // ── action=get ───────────────────────────────────────────────────────────────

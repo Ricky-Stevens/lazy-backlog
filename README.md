@@ -146,7 +146,7 @@ Settings can also be saved via `configure setup`, which is the recommended appro
 
 ## Tools
 
-8 tools, 24 actions. You don't need to memorise them — just describe what you want and the AI picks the right one.
+8 tools, 25 actions. You don't need to memorise them — just describe what you want and the AI picks the right one.
 
 ### `configure` — Get Started
 
@@ -260,16 +260,68 @@ Source-agnostic knowledge base with built-in intelligence.
 
 ---
 
-### `confluence` — Index Confluence
+### `confluence` — Index & Write-Back Confluence
 
-Spider Confluence spaces into the knowledge base. To search indexed content, use `knowledge`.
+Spider Confluence spaces into the knowledge base and publish back. To search indexed content, use `knowledge`.
 
 | Action | What it does |
 |--------|-------------|
-| `spider` | Crawl and index pages (incremental — only re-indexes changed content). Returns quality report: content depth, type distribution, pages needing classification review. |
+| `spider` | Crawl and index pages. Content-hash incremental sync — re-indexes when body **or** metadata (labels) changes, not just when `updatedAt` advances. Returns quality report: content depth, type distribution, pages needing classification review. |
 | `list-spaces` | Show available Confluence spaces |
+| `publish` | Create or update a page from markdown. **Preview-and-confirm gated** — without `confirm: true` returns a preview only; never auto-writes. Pass `pageId` to update (uses optimistic concurrency on the page version), or `spaceKey` + `title` to create. Optional `parentId` for nesting. |
 
 > *"Re-index the engineering docs"*
+> *"Publish this design doc to the PRODUCT space"* → review preview → *"Confirm"*
+
+---
+
+## Rich Content Fidelity
+
+Lazy Backlog preserves rich content end-to-end instead of flattening it to plain text:
+
+- **Tables** round-trip both directions (markdown pipe tables ↔ Jira ADF, Confluence storage `<table>`).
+- **Panels & blockquotes** are preserved as admonition syntax (`> **Note:**`, `> **Warning:**`, etc.) and rendered back into the right ADF/storage node on the way out.
+- **Confluence macros** — `info` / `note` / `warning` / `tip` panels, `code` macro (with language), `expand`, `status`, `toc`, `jira` issue macro — are rendered into markdown instead of being stripped. Unknown macros degrade gracefully to their inner text.
+- **Images & media** — Confluence `<img>` / `<ac:image>` and Jira ADF `media` / `mediaSingle` / `mediaGroup` nodes are surfaced as markdown `![alt](url)`. Confluence image references are resolved against the page's attachment manifest so diagram URLs work.
+- **Security invariants kept** — `<script>` / `<style>` and event handlers are never emitted by the markdown→storage converter, even on round-trip.
+
+---
+
+## Attachments & Downloads
+
+| Capability | How |
+|------------|-----|
+| **Surface Jira attachments** | `issues get` lists filename, mime type, human-readable size, author, created date, and download URL. Image attachments are flagged. |
+| **Upload to Jira** | `issues create` / `issues update` accept an `attachments` array of local file paths. Files are validated before upload — must exist, ≤10MB each, ≤50MB per batch — and symlinks are rejected so the server can't be tricked into uploading arbitrary local files. The API token is never logged. |
+| **Download from Jira** | `issues get` with `download: true` fetches attachment bytes to the configured directory. Optional `attachmentIds` filter selects specific files. |
+| **Confluence page attachments** | Spider fetches the per-page attachment manifest. `knowledge get-page` lists attachments and resolves inline image references. |
+| **Download from Confluence** | `knowledge get-page` with `download: true` saves selected attachments to disk. |
+
+**Safety rails on downloads:**
+- Filenames returned by the server are sanitised against path traversal (`..`, absolute paths, separators are stripped).
+- A size cap is enforced per file; content-type is recorded.
+- Download URLs are validated with the same `validateSiteUrl` / `PRIVATE_HOST_RE` guard used for the configured site — Atlassian may serve media from a different host, but it is validated, not blindly fetched. Redirects are followed manually and the final URL is re-validated (no SSRF via a redirect to a private host).
+- Files are saved only into the configured directory (see `downloadDir` below).
+
+### `downloadDir` config key
+
+Where downloaded attachments are saved. Defaults to `$HOME/lazy-backlog-downloads`. Set it via:
+
+```
+configure set --downloadDir /absolute/path/to/dir
+```
+
+This is the **only** user-controlled disk-write location and the single source of truth: `issues get` / `knowledge get-page` always write to it via the `download` flag — there is intentionally **no per-call directory override** (a malicious or prompt-injected client must not be able to redirect writes elsewhere). `configure set` validates it (absolute path, no `..` segments, not under a forbidden system path).
+
+---
+
+## Spec → Ticket Loop
+
+The Stage D workflow closes the loop between Confluence specs and Jira work — without adding new actions:
+
+- **Spec → tickets.** Pass `sourcePageId` to `issues create` to ground the generated epic + child tickets in a Confluence page from the KB. The preview inlines the spec context (tables, images, panels all preserved per A). On confirm, the epic is linked back to the source page (KB spec-link + Jira remote issue link). Use it for one-off creates, bulk creates, or epic decomposition.
+- **Status → spec.** `insights epic-progress` renders an *Implementation Status* markdown block ready to feed into `confluence publish` (confirm-gated) so the spec page tracks what shipped.
+- **Freshness loop.** When the epic completes, the source spec is automatically flagged stale and an "update the spec" suggestion is surfaced.
 
 ---
 
@@ -320,7 +372,7 @@ npm install          # Install dependencies
 npm run check        # Typecheck + lint + test (all at once)
 npm run typecheck    # TypeScript strict mode
 npm run lint         # Biome linter
-npm test             # Vitest (900+ tests)
+npm test             # Vitest (1300+ tests)
 npm run build        # Compile to dist/
 ```
 

@@ -1,7 +1,59 @@
+import type { resolveConfig } from "../lib/config.js";
+import { ConfluenceClient } from "../lib/confluence.js";
 import type { KnowledgeBase } from "../lib/db.js";
-import type { JiraClient } from "../lib/jira.js";
+import { Spider } from "../lib/indexer.js";
+import type { JiraClient, JiraSchema } from "../lib/jira.js";
 import { analyzeTeamInsights } from "../lib/team-insights.js";
 import type { TicketData } from "../lib/team-rules.js";
+
+/** Pretty-print a discovered Jira schema for the setup output. */
+export function formatSchemaResult(schema: JiraSchema): string {
+  const types = schema.issueTypes.map((t) => t.name).join(", ");
+  const fields = schema.issueTypes.reduce((n, t) => n + t.fields.length, 0);
+  const lines = [
+    `${schema.projectName} (${schema.projectKey}):`,
+    `- ${schema.issueTypes.length} issue types: ${types}`,
+    `- ${fields} fields mapped`,
+    `- ${schema.priorities.length} priorities`,
+  ];
+  if (schema.board) {
+    lines.push(`- Board: ${schema.board.name} (${schema.board.type})`);
+    if (schema.board.teamName) lines.push(`- Team: ${schema.board.teamName}`);
+  }
+  return lines.join("\n");
+}
+
+/** Crawl every requested Confluence space and return a summary string. */
+export async function spiderSpaces(
+  config: ReturnType<typeof resolveConfig>,
+  kb: KnowledgeBase,
+  spaceKeys: string[],
+  maxDepth: number,
+): Promise<string> {
+  const client = new ConfluenceClient(config);
+  const spider = new Spider(client, kb);
+  let indexed = 0;
+  let unchanged = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+  for (const spaceKey of spaceKeys) {
+    const r = await spider.crawl({ spaceKey, maxDepth, maxConcurrency: 5, includeLabels: [], excludeLabels: [] });
+    indexed += r.indexed;
+    unchanged += r.unchanged;
+    skipped += r.skipped;
+    errors.push(...r.errors);
+  }
+  const stats = kb.getStats();
+  const lines = [
+    `Indexed: ${indexed} | Unchanged: ${unchanged} | Skipped: ${skipped}`,
+    `KB total: ${stats.total} pages`,
+    `Types: ${Object.entries(stats.byType)
+      .map(([k, v]) => `${k}:${v}`)
+      .join(" ")}`,
+  ];
+  if (errors.length > 0) lines.push(`Errors: ${errors.length} (first: ${errors[0]})`);
+  return lines.join("\n");
+}
 
 type AnalyzeBacklogFn = (
   tickets: TicketData[],

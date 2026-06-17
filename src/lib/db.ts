@@ -2,6 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import type { PageType } from "../config/schema.js";
 import {
+  clearChangelogForIssueRow,
+  getChangelogRows,
+  getChangelogRowsByField,
+  getRecentlyIndexedRows,
+  getSprintRow,
+  getSprintsByBoardRows,
+  getStalePageRows,
+  type StalePageOptions,
+  upsertChangelogRows,
+  upsertSprintRow,
+  upsertSprintRows,
+} from "./db-cache.js";
+import {
   clearInsights as clearInsightsHelper,
   clearTeamRules as clearTeamRulesHelper,
   getAllInsights as getAllInsightsHelper,
@@ -10,11 +23,13 @@ import {
   getTeamRules as getTeamRulesHelper,
   type InsightRow,
   recordAnalysis as recordAnalysisHelper,
+  type TeamRuleInput,
   upsertInsight as upsertInsightHelper,
   upsertInsightsBatch,
   upsertTeamRule as upsertTeamRuleHelper,
   upsertTeamRulesBatch,
 } from "./db-insights.js";
+import { type PageWithChunks, rebuildFtsTx, upsertPagesWithChunksTx } from "./db-pages.js";
 import {
   configurePragmas,
   initSchema,
@@ -23,11 +38,22 @@ import {
   prepareStatements,
 } from "./db-schema.js";
 import { prepareSearchVariants, type SearchStatements, searchChunks, searchPages } from "./db-search.js";
+import {
+  deleteSpecLink as deleteSpecLinkHelper,
+  flagSpecStale as flagSpecStaleHelper,
+  getAllSpecLinks as getAllSpecLinksHelper,
+  getSpecLinksByIssue as getSpecLinksByIssueHelper,
+  getSpecLinksByPage as getSpecLinksByPageHelper,
+  markEpicCompleted as markEpicCompletedHelper,
+  type UpsertEpicSpecLinkInput,
+  upsertEpicSpecLink as upsertEpicSpecLinkHelper,
+} from "./db-spec-links.js";
 import type {
   BacklogAnalysisRecord,
   CachedChangelogEntry,
   CachedSprint,
   ChunkSearchResult,
+  EpicSpecLink,
   IndexedPage,
   PageSummary,
   SearchFilter,
@@ -37,7 +63,9 @@ import type {
 import { Database, type SqliteDatabase } from "./sqlite.js";
 
 export * from "./db-insights.js";
+export type { PageWithChunks } from "./db-pages.js";
 export * from "./db-search.js";
+export * from "./db-spec-links.js";
 export * from "./db-types.js";
 export { groupBy } from "./utils.js";
 
@@ -55,9 +83,10 @@ interface StatsRow {
   key: string;
   count: number;
 }
-interface UpdatedAtRow {
+interface ReindexFingerprintRow {
   id: string;
   updated_at: string | null;
+  content_hash: string | null;
 }
 
 export class KnowledgeBase {
@@ -93,6 +122,7 @@ export class KnowledgeBase {
       page.updated_at,
       page.indexed_at,
       page.source,
+      page.content_hash,
     );
   }
 
@@ -104,9 +134,31 @@ export class KnowledgeBase {
     })();
   }
 
-  needsReindex(pageId: string, remoteUpdatedAt: string | undefined): boolean {
-    const row = this.stmts.getUpdatedAt.get(pageId) as UpdatedAtRow | undefined;
+  /**
+   * Decide whether a page must be re-indexed. Returns true when:
+   * - the page has never been indexed (no row);
+   * - we cannot determine equivalence (missing both fingerprints);
+   * - the content hash differs from the stored hash (content, title, or labels
+   *   changed even if the source's `updated_at` was not bumped);
+   * - the `updated_at` advanced beyond what we have on disk.
+   *
+   * `contentHash` is optional for callers that haven't migrated yet; when
+   * omitted we fall back to the legacy updated_at-only behaviour.
+   */
+  needsReindex(pageId: string, remoteUpdatedAt: string | undefined, contentHash?: string): boolean {
+    const row = this.stmts.getReindexFingerprint.get(pageId) as ReindexFingerprintRow | undefined;
     if (!row) return true; // Not indexed yet
+    if (contentHash !== undefined) {
+      // Hash-aware path. A NULL stored hash means we haven't fingerprinted this
+      // page yet (legacy row) — re-index so we backfill the hash.
+      if (row.content_hash === null) return true;
+      if (row.content_hash !== contentHash) return true;
+      // Hashes match: content/labels/title unchanged. Still re-index if the
+      // remote claims a newer updated_at (defensive — metadata may have moved
+      // without affecting the hash, e.g. version numbers, parent ids).
+      if (remoteUpdatedAt && row.updated_at !== remoteUpdatedAt) return true;
+      return false;
+    }
     if (!remoteUpdatedAt) return true; // Can't compare, re-index to be safe
     return row.updated_at !== remoteUpdatedAt;
   }
@@ -191,114 +243,60 @@ export class KnowledgeBase {
     })();
   }
 
+  /** See `upsertPagesWithChunksTx` in `db-pages.ts` for full notes. */
+  upsertPagesWithChunks(entries: PageWithChunks[]): number {
+    return upsertPagesWithChunksTx(this.db, this.stmts, (p) => this.upsertPage(p), entries);
+  }
+
   searchChunks(query: string, options?: SearchFilter): ChunkSearchResult[] {
     return searchChunks(query, options ?? {}, this.searchStmts);
   }
 
   upsertSprint(sprint: CachedSprint): void {
-    this.stmts.upsertSprint.run(
-      sprint.id,
-      sprint.board_id,
-      sprint.name,
-      sprint.state,
-      sprint.goal,
-      sprint.start_date,
-      sprint.end_date,
-      sprint.complete_date,
-      sprint.cached_at,
-    );
+    upsertSprintRow(this.stmts, sprint);
   }
 
   upsertSprints(sprints: CachedSprint[]): void {
-    this.db.transaction(() => {
-      for (const sprint of sprints) {
-        this.upsertSprint(sprint);
-      }
-    })();
+    upsertSprintRows(this.db, this.stmts, sprints);
   }
 
   getSprint(id: string): CachedSprint | undefined {
-    return this.stmts.getSprintById.get(id) as CachedSprint | undefined;
+    return getSprintRow(this.stmts, id);
   }
 
   getSprintsByBoard(boardId: string, state?: string): CachedSprint[] {
-    if (state) {
-      return this.stmts.getSprintsByBoardAndState.all(boardId, state) as CachedSprint[];
-    }
-    return this.stmts.getSprintsByBoard.all(boardId) as CachedSprint[];
+    return getSprintsByBoardRows(this.stmts, boardId, state);
   }
 
   upsertChangelog(entries: CachedChangelogEntry[]): void {
-    this.db.transaction(() => {
-      for (const entry of entries) {
-        this.stmts.insertChangelog.run(
-          entry.id,
-          entry.issue_key,
-          entry.author_name,
-          entry.author_id,
-          entry.created,
-          entry.field,
-          entry.from_value,
-          entry.to_value,
-          entry.cached_at,
-        );
-      }
-    })();
+    upsertChangelogRows(this.db, this.stmts, entries);
   }
 
   getChangelog(issueKey: string): CachedChangelogEntry[] {
-    return this.stmts.getChangelogByIssue.all(issueKey) as CachedChangelogEntry[];
+    return getChangelogRows(this.stmts, issueKey);
   }
 
   getChangelogByField(issueKey: string, field: string): CachedChangelogEntry[] {
-    return this.stmts.getChangelogByIssueAndField.all(issueKey, field) as CachedChangelogEntry[];
+    return getChangelogRowsByField(this.stmts, issueKey, field);
   }
 
   clearChangelogForIssue(issueKey: string): void {
-    this.stmts.deleteChangelogByIssue.run(issueKey);
+    clearChangelogForIssueRow(this.stmts, issueKey);
   }
 
-  getStalePages(cutoffDate: string, opts?: { spaceKey?: string; pageType?: string; source?: string }): IndexedPage[] {
-    if (opts?.pageType && opts?.spaceKey) {
-      return this.stmts.getStalePagesAll.all(cutoffDate, opts.pageType, opts.spaceKey) as IndexedPage[];
-    }
-    if (opts?.pageType) {
-      return this.stmts.getStalePagesTyped.all(cutoffDate, opts.pageType) as IndexedPage[];
-    }
-    if (opts?.spaceKey) {
-      return this.stmts.getStalePagesFiltered.all(cutoffDate, opts.spaceKey) as IndexedPage[];
-    }
-    return this.stmts.getStalePages.all(cutoffDate) as IndexedPage[];
+  getStalePages(cutoffDate: string, opts?: StalePageOptions): IndexedPage[] {
+    return getStalePageRows(this.stmts, cutoffDate, opts);
   }
 
   getRecentlyIndexed(since: string, source?: string): IndexedPage[] {
-    if (source) {
-      return this.stmts.getRecentlyIndexedBySource.all(since, source) as IndexedPage[];
-    }
-    return this.stmts.getRecentlyIndexed.all(since) as IndexedPage[];
+    return getRecentlyIndexedRows(this.stmts, since, source);
   }
 
-  upsertTeamRule(rule: {
-    category: string;
-    rule_key: string;
-    issue_type: string | null;
-    rule_value: string;
-    confidence: number;
-    sample_size: number;
-  }): void {
+  upsertTeamRule(rule: TeamRuleInput): void {
     upsertTeamRuleHelper(this.stmts, rule);
   }
 
-  upsertTeamRules(
-    rules: Array<{
-      category: string;
-      rule_key: string;
-      issue_type: string | null;
-      rule_value: string;
-      confidence: number;
-      sample_size: number;
-    }>,
-  ): void {
+  upsertTeamRules(rules: TeamRuleInput[]): void {
     upsertTeamRulesBatch(this.db, this.stmts, rules);
   }
 
@@ -340,19 +338,32 @@ export class KnowledgeBase {
     clearInsightsHelper(this.stmts, category);
   }
 
+  // ── Spec ↔ Epic links (Stage D) — implementations in db-spec-links.ts ──
+  upsertEpicSpecLink(input: UpsertEpicSpecLinkInput): void {
+    upsertEpicSpecLinkHelper(this.stmts, input);
+  }
+  getSpecLinksByIssue(issueKey: string): EpicSpecLink[] {
+    return getSpecLinksByIssueHelper(this.stmts, issueKey);
+  }
+  getSpecLinksByPage(pageId: string): EpicSpecLink[] {
+    return getSpecLinksByPageHelper(this.stmts, pageId);
+  }
+  getAllSpecLinks(): EpicSpecLink[] {
+    return getAllSpecLinksHelper(this.stmts);
+  }
+  flagSpecStale(issueKey: string, pageId: string): boolean {
+    return flagSpecStaleHelper(this.stmts, issueKey, pageId);
+  }
+  markEpicCompleted(issueKey: string, pageId: string): boolean {
+    return markEpicCompletedHelper(this.stmts, issueKey, pageId);
+  }
+  deleteSpecLink(issueKey: string, pageId: string): boolean {
+    return deleteSpecLinkHelper(this.stmts, issueKey, pageId);
+  }
+
+  /** See `rebuildFtsTx` in `db-pages.ts` for the notes. */
   rebuildFts(): void {
-    this.db.transaction(() => {
-      this.db.exec("DELETE FROM pages_fts");
-      this.db.exec(`
-        INSERT INTO pages_fts(rowid, title, content, labels)
-        SELECT rowid, title, content, labels FROM pages
-      `);
-      this.db.exec("DELETE FROM chunks_fts");
-      this.db.exec(`
-        INSERT INTO chunks_fts(rowid, heading, breadcrumb, content)
-        SELECT id, heading, breadcrumb, content FROM chunks
-      `);
-    })();
+    rebuildFtsTx(this.db);
   }
 
   getDbSizeBytes(): number {

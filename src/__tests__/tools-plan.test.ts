@@ -49,6 +49,7 @@ function makePage(overrides: Partial<IndexedPage> = {}): IndexedPage {
     updated_at: overrides.updated_at ?? "2025-06-01T00:00:00Z",
     indexed_at: overrides.indexed_at ?? new Date().toISOString(),
     source: overrides.source ?? "confluence",
+    content_hash: overrides.content_hash ?? null,
   };
 }
 

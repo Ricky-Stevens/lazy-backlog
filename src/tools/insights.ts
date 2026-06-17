@@ -2,7 +2,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { computeVelocity } from "../lib/analytics.js";
 import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
-import type { KnowledgeBase } from "../lib/db.js";
+import type { EpicSpecLink, KnowledgeBase } from "../lib/db.js";
+import {
+  buildSpecStatusSection,
+  type EpicChildIssue,
+  type EpicProgressSummary,
+  summariseEpicStatus,
+} from "../lib/spec-context.js";
 import { formatTeamInsights } from "../lib/team-insights.js";
 import { handlePlanAction } from "./insights-plan.js";
 import { loadTeamInsights } from "./issues-helpers.js";
@@ -260,8 +266,73 @@ async function handleEpicProgress(params: { epicKey?: string }, kb: KnowledgeBas
       /* graceful: skip blocker detection if links unavailable */
     }
 
-    const behindSchedule = remainingPoints > completedPoints;
-    const suggestions = buildSuggestions("insights", "epic-progress", { behindSchedule });
+    // ── Stage D: spec write-back + freshness loop ─────────────────────────
+    const summary: EpicProgressSummary = summariseEpicStatus(
+      issues.map<EpicChildIssue>((issue) => {
+        const f = issue.fields as Record<string, unknown>;
+        const sp =
+          (spField ? (f[spField] as number | undefined) : undefined) ??
+          (f.story_points as number | undefined) ??
+          (f.customfield_10016 as number | undefined) ??
+          0;
+        return {
+          key: issue.key,
+          summary: issue.fields.summary,
+          statusName: issue.fields.status?.name ?? "Unknown",
+          statusCategory: issue.fields.status?.statusCategory?.name ?? "new",
+          storyPoints: sp,
+        };
+      }),
+    );
+
+    let specLinks: EpicSpecLink[] = [];
+    let staleFlagged = 0;
+    try {
+      specLinks = kb.getSpecLinksByIssue(params.epicKey);
+      if (summary.isComplete) {
+        for (const link of specLinks) {
+          kb.markEpicCompleted(link.issue_key, link.page_id);
+          // Only flag stale the first time the epic completes, to avoid
+          // re-flagging a spec the user has already refreshed.
+          if (!link.stale_flagged_at) {
+            if (kb.flagSpecStale(link.issue_key, link.page_id)) staleFlagged++;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[insights epic-progress] spec link bookkeeping failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (specLinks.length > 0) {
+      out += `\n## Source Spec${specLinks.length === 1 ? "" : "s"}\n`;
+      for (const link of specLinks) {
+        const target = link.page_url
+          ? `[${link.page_title ?? link.page_id}](${link.page_url})`
+          : (link.page_title ?? link.page_id);
+        const flags: string[] = [];
+        if (link.completed_at || summary.isComplete) flags.push("epic complete");
+        if (link.stale_flagged_at) flags.push("stale — needs refresh");
+        else if (staleFlagged > 0) flags.push("flagged stale now");
+        out += `- ${target} (page ${link.page_id}, source ${link.source})${flags.length > 0 ? ` — ${flags.join(", ")}` : ""}\n`;
+      }
+      out += `\n### Implementation Status (markdown to publish)\n\n`;
+      out += `> Pass the content below to \`confluence publish\` with the page id above to write the status back into the spec.\n\n`;
+      // Use the first spec link's page title as a stand-in for the epic summary.
+      // Avoids an extra Jira fetch — best signal we have without a getIssue call.
+      const epicSummaryText = specLinks[0]?.page_title ?? null;
+      out += "```markdown\n";
+      out += buildSpecStatusSection(params.epicKey, config.siteUrl, summary, { epicSummary: epicSummaryText });
+      out += "\n```\n";
+    }
+
+    const behindSchedule = summary.remainingPoints > summary.completedPoints;
+    const suggestions = buildSuggestions("insights", "epic-progress", {
+      behindSchedule,
+      hasSpecLink: specLinks.length > 0,
+      epicComplete: summary.isComplete,
+    });
     return textResponse(out + suggestions);
   } catch (err: unknown) {
     return errorResponse(
@@ -277,12 +348,11 @@ export function registerInsightsTool(server: McpServer, getKb: () => KnowledgeBa
     "insights",
     {
       description:
-        "Team intelligence and analytics. Use this tool for understanding team performance, patterns, and progress. " +
-        "Actions: 'team-profile' — view stored team intelligence from setup: who owns what components, estimation patterns, " +
-        "description templates, rework rates, and conventions (zero API calls — reads local analysis). " +
-        "'epic-progress' — show epic completion stats with velocity-based forecast. " +
-        "'retro' — sprint retrospective data (scope creep, cycle time, workload distribution, carry-over). " +
-        "'plan' — sprint planning assistant: velocity, carryover, capacity budget, recommended items from backlog.",
+        "Team intelligence and analytics. Actions: 'team-profile' — stored team intelligence (ownership, estimation, templates, rework, conventions; reads local analysis). " +
+        "'epic-progress' — completion stats + velocity forecast; offers \"publish status\" write-back via 'confluence publish' when a source spec is linked. " +
+        "'retro' — sprint retrospective (scope creep, cycle time, workload, carry-over). " +
+        "'plan' — sprint planning (velocity, carryover, capacity, recommended backlog items). " +
+        "For issue CRUD use 'issues'; for ranking 'backlog'; for sprint CRUD 'sprints'.",
       inputSchema: z.object({
         action: z.enum(["team-profile", "epic-progress", "retro", "plan"]),
         epicKey: z.string().optional().describe("[epic-progress] Epic issue key, e.g. 'BP-100'"),

@@ -63,7 +63,7 @@ export function registerSprintsTool(server: McpServer, getKb: () => KnowledgeBas
     "sprints",
     {
       description:
-        "Jira sprint management. Use this tool for sprint CRUD and monitoring. Actions: 'list' show sprints (use state='active' for current sprint). 'get' context-adaptive sprint view — active sprints show full dashboard with health, use 'since' for standup mode, closed sprints show release notes, future sprints show planned items. 'create' a new sprint. 'update' rename sprint, set goal, or change dates. 'move-issues' assign issues to a sprint. For velocity, retros, epic progress, and team intelligence use the 'insights' tool. For individual issues use 'issues'. For bug workflows use 'bugs'. For backlog use 'backlog'.",
+        "Jira sprint management. Actions: 'list' show sprints (use state='active' for \"current sprint\"). 'get' context-adaptive view — active shows dashboard + health, pass `since` for \"standup\" mode, closed shows release notes. 'create' new sprint. 'update' rename, set goal, or change dates. 'move-issues' assign issues to a sprint. For velocity/retros/epic-progress use 'insights'. For issue CRUD use 'issues'; for triage 'bugs'; for ranking 'backlog'.",
       inputSchema: z.object({
         action: z.enum(["list", "get", "create", "update", "move-issues"]),
         state: z.enum(["active", "future", "closed"]).optional().describe("[list] Filter sprints by state"),

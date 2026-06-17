@@ -2,6 +2,12 @@
  * Shared HTTP retry/backoff utilities used by Jira and Confluence clients.
  */
 
+// The TS config lib is `ESNext` only (no DOM). Node 18+ provides `RequestInit`
+// as a global (via @types/node + undici-types), but `BodyInit` is not re-exported
+// as a global. Derive it from `RequestInit["body"]` to stay aligned with the
+// runtime's actual fetch signature.
+type BodyInit = NonNullable<RequestInit["body"]>;
+
 export const MAX_RETRIES = 3;
 export const INITIAL_BACKOFF_MS = 1_000;
 export const RETRYABLE_STATUSES = new Set([429, 500, 502, 503]);
@@ -27,6 +33,27 @@ export interface FetchWithRetryOptions {
 /** Compute the backoff delay for a given attempt (exponential). */
 function backoffMs(attempt: number): number {
   return INITIAL_BACKOFF_MS * (1 << attempt);
+}
+
+/**
+ * Serialize a request body for `fetch`.
+ *
+ * Plain objects/arrays become JSON. FormData / Blob / ArrayBuffer / Uint8Array
+ * are passed through untouched so multipart uploads work. Strings are sent as-is.
+ */
+function serializeBody(body: unknown): BodyInit | undefined {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === "string") return body;
+  if (body instanceof FormData) return body;
+  if (body instanceof URLSearchParams) return body;
+  if (body instanceof Blob) return body;
+  if (body instanceof ArrayBuffer) return body;
+  if (ArrayBuffer.isView(body)) {
+    // Use the underlying ArrayBuffer slice to avoid passing a SharedArrayBuffer-backed view.
+    const view = body as ArrayBufferView;
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
+  }
+  return JSON.stringify(body);
 }
 
 /** Determine whether a response should be retried and the delay to wait. */
@@ -70,7 +97,7 @@ export async function fetchWithRetry(url: string, options: FetchWithRetryOptions
       res = await fetch(url, {
         method,
         headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: serializeBody(body),
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err: unknown) {

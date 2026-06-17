@@ -16,6 +16,12 @@ export interface IndexedPage {
   updated_at: string | null;
   indexed_at: string;
   source: string;
+  /**
+   * Content fingerprint covering title + content + labels. Lets the spider
+   * detect content/label-only edits even when the source's `updated_at`
+   * doesn't advance. Nullable for legacy rows pre-migration.
+   */
+  content_hash: string | null;
 }
 
 /** Lightweight projection — no content body. */
@@ -111,4 +117,20 @@ export interface SearchFilter {
   pageType?: string;
   spaceKey?: string;
   limit?: number;
+}
+
+/**
+ * Persistent link between a generated Jira issue (typically an epic) and the
+ * Confluence page it was generated from. Used for status write-back (D2) and
+ * the freshness loop (D3).
+ */
+export interface EpicSpecLink {
+  issue_key: string;
+  page_id: string;
+  source: string;
+  page_title: string | null;
+  page_url: string | null;
+  stale_flagged_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }

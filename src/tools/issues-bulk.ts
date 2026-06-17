@@ -2,6 +2,7 @@ import { buildJiraClient, errorResponse, resolveConfig, textResponse } from "../
 import type { KnowledgeBase } from "../lib/db.js";
 import { findDuplicates } from "../lib/duplicate-detect.js";
 import { JiraClient, type JiraTicketInput } from "../lib/jira.js";
+import { formatSpecContextSection, formatSpecLinkLine } from "../lib/spec-context.js";
 import type { TicketContext } from "../lib/team-insights-suggest.js";
 import {
   formatInsightsSection,
@@ -10,6 +11,7 @@ import {
 } from "../lib/team-insights-suggest.js";
 import { DEFAULT_RULES, mergeWithDefaults } from "../lib/team-rules.js";
 import { evaluateConventions } from "../lib/team-rules-format.js";
+import { buildDescriptionWithSpecRef, loadSourceSpec, persistSpecLink } from "./issues-create-spec.js";
 import {
   buildKbContextSection,
   buildSchemaGuidance,
@@ -159,6 +161,8 @@ export async function handleBulkCreateAction(
     tickets?: BulkTicket[];
     confirmed?: boolean;
     spaceKey?: string;
+    sourcePageId?: string;
+    sourcePageSource?: string;
   },
   kb: KnowledgeBase,
 ) {
@@ -171,8 +175,16 @@ export async function handleBulkCreateAction(
     return errorResponse(String(err));
   }
 
-  if (!params.confirmed) return buildBulkPreview(kb, params.tickets, config.jiraProjectKey, params.spaceKey);
-  return executeBulkCreate(kb, params.tickets, config);
+  if (!params.confirmed)
+    return buildBulkPreview(
+      kb,
+      params.tickets,
+      config.jiraProjectKey,
+      params.spaceKey,
+      params.sourcePageId,
+      params.sourcePageSource,
+    );
+  return executeBulkCreate(kb, params.tickets, config, params.sourcePageId, params.sourcePageSource);
 }
 
 async function buildBulkPreview(
@@ -180,10 +192,13 @@ async function buildBulkPreview(
   tickets: BulkTicket[],
   projectKey: string | undefined,
   spaceKey?: string,
+  sourcePageId?: string,
+  sourcePageSource?: string,
 ) {
   const schema = JiraClient.loadSchemaFromDb(kb);
   const issueType = tickets[0]?.issueType || "Task";
-  const searchText = tickets.map((t) => t.summary).join(" ");
+  const sourceSpec = loadSourceSpec(kb, sourcePageId, sourcePageSource);
+  const searchText = [tickets.map((t) => t.summary).join(" "), sourceSpec?.content ?? ""].join(" ");
   const ctx = retrieveKbContext(kb, searchText, spaceKey);
   const kbContextText = buildKbContextSection(ctx);
 
@@ -210,19 +225,30 @@ async function buildBulkPreview(
   );
 
   let out = buildBulkPreviewCard(previews);
+  const specSection = formatSpecContextSection(sourceSpec);
+  if (specSection) out += specSection;
+  else if (sourcePageId)
+    out += `\n\n> **Source spec not found.** sourcePageId='${sourcePageId}' is not indexed in the KB. Run \`confluence spider\` first or omit the param.\n`;
   out += `\n---\n**STOP: Show this preview to the user and wait for their approval.** Do NOT proceed with \`confirmed=true\` until the user explicitly confirms. Ask the user to review the tickets above.\n`;
   return textResponse(out);
 }
 
-async function executeBulkCreate(kb: KnowledgeBase, tickets: BulkTicket[], config: ReturnType<typeof resolveConfig>) {
+async function executeBulkCreate(
+  kb: KnowledgeBase,
+  tickets: BulkTicket[],
+  config: ReturnType<typeof resolveConfig>,
+  sourcePageId?: string,
+  sourcePageSource?: string,
+) {
   const projectKey = config.jiraProjectKey;
   if (!projectKey) return errorResponse("No project key. Run configure or pass projectKey.");
 
   const schema = JiraClient.loadSchemaFromDb(kb);
   const jira = new JiraClient({ ...config, jiraProjectKey: projectKey }, schema);
+  const sourceSpec = loadSourceSpec(kb, sourcePageId, sourcePageSource);
   const inputs: JiraTicketInput[] = tickets.map((t) => ({
     summary: t.summary,
-    description: t.description,
+    description: buildDescriptionWithSpecRef(t.description, sourceSpec),
     issueType: t.issueType,
     priority: t.priority,
     labels: t.labels,
@@ -233,5 +259,27 @@ async function executeBulkCreate(kb: KnowledgeBase, tickets: BulkTicket[], confi
   }));
 
   const result = await jira.createIssuesBatch(inputs);
-  return formatBulkResult(result, tickets.length, config.siteUrl);
+
+  // Best-effort link persistence for every successfully-created issue.
+  let specSummary = "";
+  if (sourceSpec && result.issues.length > 0) {
+    const linkErrors: string[] = [];
+    for (const issue of result.issues) {
+      const { remoteLinkError } = await persistSpecLink(kb, jira, issue.key, sourceSpec);
+      if (remoteLinkError) linkErrors.push(`${issue.key}: ${remoteLinkError}`);
+    }
+    specSummary = formatSpecLinkLine(sourceSpec);
+    if (linkErrors.length > 0) {
+      specSummary += `\n_Note: ${linkErrors.length} remote-link attempt(s) failed — ${linkErrors.slice(0, 3).join("; ")}${linkErrors.length > 3 ? "; …" : ""}_`;
+    }
+  } else if (sourcePageId && !sourceSpec) {
+    specSummary = `\n_Note: sourcePageId='${sourcePageId}' was not found in the KB — skipping spec links._`;
+  }
+
+  const base = formatBulkResult(result, tickets.length, config.siteUrl);
+  if (specSummary) {
+    const text = base.content[0]?.text ?? "";
+    return { ...base, content: [{ type: "text" as const, text: text + specSummary }] };
+  }
+  return base;
 }

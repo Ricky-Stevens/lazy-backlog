@@ -3,6 +3,7 @@ import { z } from "zod";
 import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
 import { JiraClient } from "../lib/jira.js";
+import { uploadAttachmentsFromPaths } from "./issues-attachments.js";
 import { handleBulkCreateAction } from "./issues-bulk.js";
 import { handleCreateAction, handleDecomposeAction } from "./issues-create.js";
 import { handleGetAction, handleSearchAction } from "./issues-get.js";
@@ -10,9 +11,11 @@ import { boolPreprocess, checkEnrichmentGaps, jsonPreprocess } from "./issues-he
 
 // ── Barrel re-exports ─────────────────────────────────────────────────────────
 
+export * from "./issues-attachments.js";
 export * from "./issues-bulk.js";
 export * from "./issues-create.js";
 export * from "./issues-get.js";
+export * from "./issues-get-download.js";
 export * from "./issues-helpers.js";
 
 // ── Params type alias (inferred from the Zod schema) ─────────────────────────
@@ -55,6 +58,11 @@ interface IssueParams {
   links?: Array<{ targetKey: string; linkType: string; direction: "inward" | "outward" }>;
   removeLinks?: Array<{ targetKey: string; linkType: string }>;
   spaceKey?: string;
+  attachments?: string[];
+  download?: boolean;
+  attachmentIds?: string[];
+  sourcePageId?: string;
+  sourcePageSource?: string;
 }
 
 // ── Update helpers ───────────────────────────────────────────────────────────
@@ -154,11 +162,7 @@ async function applyRanking(
   rankAfter: string | undefined,
   changes: string[],
 ) {
-  await (
-    jira as unknown as {
-      rankIssue(key: string, opts: { rankBefore?: string; rankAfter?: string }): Promise<void>;
-    }
-  ).rankIssue(issueKey, {
+  await jira.rankIssue(issueKey, {
     ...(rankBefore ? { rankBefore } : {}),
     ...(rankAfter ? { rankAfter } : {}),
   });
@@ -213,6 +217,12 @@ async function handleUpdateAction(params: IssueParams, kb: KnowledgeBase) {
       await applyRanking(jira, params.issueKey, params.rankBefore, params.rankAfter, changes);
     }
 
+    if (params.attachments?.length) {
+      const { uploaded, errors } = await uploadAttachmentsFromPaths(jira, params.issueKey, params.attachments);
+      if (uploaded > 0) changes.push(`Attachments: ${uploaded} uploaded`);
+      for (const e of errors) changes.push(`Attachment error: ${e}`);
+    }
+
     const changesList = changes.map((c) => `- ${c}`).join("\n");
     let response = `Updated **${params.issueKey}** — ${url}\n\nChanges:\n${changesList}`;
 
@@ -248,7 +258,7 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
     "issues",
     {
       description:
-        "Jira issue CRUD. 'create' returns preview first — set confirmed=true only after user approval. Pass tickets array for bulk, epicKey without summary to decompose. Actions: 'get' fetch issue(s). 'create' single/bulk/decompose. 'update' fields/status/assignee/links. 'search' JQL query. Use 'insights' for analytics, 'bugs' for triage, 'backlog' for ranking, 'sprints' for sprint ops.",
+        "Jira issue CRUD. 'create' returns preview first — set confirmed=true only after user approval. Pass tickets array for bulk, epicKey without summary to decompose. Pass sourcePageId to ground a 'spec to ticket' create on a Confluence page. Actions: 'get' fetch issue(s). 'create' single/bulk/decompose. 'update' fields/status/assignee/links. 'search' JQL query. Use 'insights' for analytics + epic status write-back, 'bugs' for triage, 'backlog' for ranking, 'sprints' for sprint ops, 'confluence publish' for spec write-back.",
       inputSchema: z.object({
         action: z.enum(["get", "create", "update", "search"]),
         // Shared identifiers
@@ -334,6 +344,31 @@ export function registerIssuesTool(server: McpServer, getKb: () => KnowledgeBase
           .optional()
           .describe("[update] Remove issue links by target key and link type"),
         spaceKey: z.string().optional().describe("[create] Confluence space key to search for relevant context"),
+        attachments: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "[create, update] Local file paths to upload as Jira attachments. Files must exist, must be <=10MB each, and must not be on a private/internal host.",
+          ),
+        download: z
+          .preprocess(boolPreprocess, z.boolean().default(false))
+          .optional()
+          .describe(
+            "[get] When true, fetch the issue's attachments to the configured download directory (config key 'downloadDir'). Single-issue only.",
+          ),
+        attachmentIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "[get] Optional filter — only download attachments whose id or filename appears in this list. Defaults to all attachments.",
+          ),
+        sourcePageId: z
+          .string()
+          .optional()
+          .describe(
+            "[create] Source page ID grounding the ticket. Inlined into the preview; on confirmed create the issue is linked back to the page (KB + Jira remote link).",
+          ),
+        sourcePageSource: z.string().optional().describe("[create] Source of sourcePageId (defaults to 'confluence')."),
       }),
     },
     async (params) => {

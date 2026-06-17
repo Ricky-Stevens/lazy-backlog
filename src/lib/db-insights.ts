@@ -60,7 +60,7 @@ export function clearInsights(stmts: PreparedStatements, category?: string): voi
 
 // ── Team rules ──
 
-interface TeamRuleInput {
+export interface TeamRuleInput {
   category: string;
   rule_key: string;
   issue_type: string | null;

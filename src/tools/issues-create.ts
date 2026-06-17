@@ -2,6 +2,7 @@ import { buildJiraClient, errorResponse, textResponse } from "../lib/config.js";
 import type { KnowledgeBase } from "../lib/db.js";
 import { findDuplicates } from "../lib/duplicate-detect.js";
 import { JiraClient, type JiraTicketInput } from "../lib/jira.js";
+import { formatSpecContextSection, formatSpecLinkLine } from "../lib/spec-context.js";
 import type { TicketContext } from "../lib/team-insights-suggest.js";
 import {
   formatInsightsSection,
@@ -10,6 +11,8 @@ import {
 } from "../lib/team-insights-suggest.js";
 import { DEFAULT_RULES, formatTeamStyleGuide, mergeWithDefaults } from "../lib/team-rules.js";
 import { evaluateConventions, formatConventionsSection } from "../lib/team-rules-format.js";
+import { uploadAttachmentsFromPaths } from "./issues-attachments.js";
+import { buildDescriptionWithSpecRef, loadSourceSpec, persistSpecLink } from "./issues-create-spec.js";
 import {
   buildKbContextSection,
   buildSchemaGuidance,
@@ -19,6 +22,10 @@ import {
 } from "./issues-helpers.js";
 import { buildPreviewCard, type PreviewData } from "./preview-builder.js";
 import { buildSuggestions } from "./suggestions.js";
+
+// Re-export the Stage D spec helpers so callers that import them via
+// `tools/issues-create.js` (or `tools/issues.js`) keep working.
+export * from "./issues-create-spec.js";
 
 // ── Shared Helpers ───────────────────────────────────────────────────────────
 
@@ -140,26 +147,35 @@ function buildConventions(
   return evaluateConventions(ticket, merged);
 }
 
+/** Shared params shape for create flows. */
+interface CreateParamsBase {
+  summary: string;
+  description?: string;
+  issueType?: string;
+  priority?: string;
+  labels?: string[];
+  storyPoints?: number;
+  parent?: string;
+  parentKey?: string;
+  components?: string[];
+  namedFields?: Record<string, string | null>;
+  spaceKey?: string;
+  attachments?: string[];
+  /** Optional Confluence (or future source) page id used as grounding context. */
+  sourcePageId?: string;
+  /** Source the page id belongs to. Defaults to "confluence" for backwards compat. */
+  sourcePageSource?: string;
+}
+
 /** Build the confirmed-creation response for a single ticket. */
-async function executeCreate(
-  kb: KnowledgeBase,
-  params: {
-    summary: string;
-    description?: string;
-    issueType?: string;
-    priority?: string;
-    labels?: string[];
-    storyPoints?: number;
-    parent?: string;
-    parentKey?: string;
-    components?: string[];
-    namedFields?: Record<string, string | null>;
-  },
-) {
+async function executeCreate(kb: KnowledgeBase, params: CreateParamsBase) {
   const { jira, config } = buildJiraClient(kb);
+  const sourceSpec = loadSourceSpec(kb, params.sourcePageId, params.sourcePageSource);
+  const description = buildDescriptionWithSpecRef(params.description, sourceSpec);
+
   const input: JiraTicketInput = {
     summary: params.summary,
-    description: params.description,
+    description,
     issueType: params.issueType || "Task",
     priority: params.priority,
     labels: params.labels,
@@ -169,9 +185,33 @@ async function executeCreate(
     namedFields: params.namedFields,
   };
   const created = await jira.createIssue(input);
-  const suggestions = buildSuggestions("issues", "create", { confirmed: true });
+
+  let attachmentLine = "";
+  if (params.attachments && params.attachments.length > 0) {
+    const outcome = await uploadAttachmentsFromPaths(jira, created.key, params.attachments);
+    const parts = [`${outcome.uploaded}/${params.attachments.length} attachment(s) uploaded`];
+    if (outcome.errors.length > 0) parts.push(`errors: ${outcome.errors.join("; ")}`);
+    attachmentLine = `\nAttachments: ${parts.join(" — ")}`;
+  }
+
+  let specLinkLine = "";
+  if (sourceSpec) {
+    const { remoteLinkError } = await persistSpecLink(kb, jira, created.key, sourceSpec);
+    specLinkLine = formatSpecLinkLine(sourceSpec);
+    if (remoteLinkError) {
+      specLinkLine += `\n_Note: could not attach Jira remote link — ${remoteLinkError}_`;
+    }
+  } else if (params.sourcePageId) {
+    specLinkLine = `\n_Note: sourcePageId='${params.sourcePageId}' was not found in the KB — skipping spec link. Run \`confluence spider\` to index it._`;
+  }
+
+  const suggestions = buildSuggestions("issues", "create", {
+    confirmed: true,
+    hasAttachments: (params.attachments?.length ?? 0) > 0,
+    hasSourceSpec: !!sourceSpec,
+  });
   return textResponse(
-    `Created **${created.key}** — ${config.siteUrl}/browse/${created.key}\n\nSummary: ${params.summary}${suggestions}`,
+    `Created **${created.key}** — ${config.siteUrl}/browse/${created.key}\n\nSummary: ${params.summary}${attachmentLine}${specLinkLine}${suggestions}`,
   );
 }
 
@@ -179,20 +219,7 @@ async function executeCreate(
 
 /** Handle the 'create' action (preview + confirm flow). */
 export async function handleCreateAction(
-  params: {
-    summary?: string;
-    description?: string;
-    issueType?: string;
-    priority?: string;
-    labels?: string[];
-    storyPoints?: number;
-    parent?: string;
-    parentKey?: string;
-    components?: string[];
-    namedFields?: Record<string, string | null>;
-    confirmed?: boolean;
-    spaceKey?: string;
-  },
+  params: Partial<CreateParamsBase> & { confirmed?: boolean },
   kb: KnowledgeBase,
 ) {
   if (!params.summary) {
@@ -205,25 +232,13 @@ export async function handleCreateAction(
   return buildCreatePreview(kb, params as typeof params & { summary: string });
 }
 
-async function buildCreatePreview(
-  kb: KnowledgeBase,
-  params: {
-    summary: string;
-    description?: string;
-    issueType?: string;
-    priority?: string;
-    labels?: string[];
-    storyPoints?: number;
-    parent?: string;
-    parentKey?: string;
-    components?: string[];
-    namedFields?: Record<string, string | null>;
-    spaceKey?: string;
-  },
-) {
+async function buildCreatePreview(kb: KnowledgeBase, params: CreateParamsBase) {
   const schema = JiraClient.loadSchemaFromDb(kb);
   const issueType = params.issueType || "Task";
-  const searchText = `${params.summary} ${params.description || ""}`;
+  const sourceSpec = loadSourceSpec(kb, params.sourcePageId, params.sourcePageSource);
+  // Use the spec body as additional search context when present so retrieveKbContext
+  // pulls related ADRs/designs alongside the spec itself.
+  const searchText = [params.summary, params.description ?? "", sourceSpec?.content ?? ""].join(" ");
   const ctx = retrieveKbContext(kb, searchText, params.spaceKey);
 
   const hasParent = !!(params.parent || params.parentKey);
@@ -261,26 +276,16 @@ async function buildCreatePreview(
   };
 
   let out = buildPreviewCard(previewData);
+  const specSection = formatSpecContextSection(sourceSpec);
+  if (specSection) out += specSection;
+  else if (params.sourcePageId)
+    out += `\n\n> **Source spec not found.** sourcePageId='${params.sourcePageId}' is not indexed in the KB. Run \`confluence spider\` first or omit the param.\n`;
   if (epicsSection) out += `\n\n${epicsSection}`;
   out += `\n---\n**STOP: Show this preview to the user and wait for their approval.** Do NOT proceed with \`confirmed=true\` until the user explicitly confirms. Ask the user to review the fields, description, and epic assignment above.\n`;
   return textResponse(out);
 }
 
-async function executeCreateConfirmed(
-  kb: KnowledgeBase,
-  params: {
-    summary: string;
-    description?: string;
-    issueType?: string;
-    priority?: string;
-    labels?: string[];
-    storyPoints?: number;
-    parent?: string;
-    parentKey?: string;
-    components?: string[];
-    namedFields?: Record<string, string | null>;
-  },
-) {
+async function executeCreateConfirmed(kb: KnowledgeBase, params: CreateParamsBase) {
   try {
     return await executeCreate(kb, params);
   } catch (err: unknown) {
