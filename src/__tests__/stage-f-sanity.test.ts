@@ -289,10 +289,7 @@ describe("Stage F — documentation contract", () => {
     expect(readme).toMatch(/[Cc]ontent.?[Hh]ash/);
   });
 
-  it("CLAUDE.md is updated to 8 tools / 25 actions with the publish action and downloadDir key", () => {
-    const claude = readFileSync(join(REPO_ROOT, "CLAUDE.md"), "utf-8");
-    expect(claude).toMatch(/8 (MCP )?[Tt]ools.*25 [Aa]ctions/);
-    expect(claude).toMatch(/publish/);
-    expect(claude).toMatch(/downloadDir/);
-  });
+  // NOTE: CLAUDE.md is intentionally gitignored (developer-local AI tooling), so it is
+  // absent in CI's clean checkout. A committed test must not depend on an un-committed
+  // file — the README contract above covers the public, shipped documentation surface.
 });
