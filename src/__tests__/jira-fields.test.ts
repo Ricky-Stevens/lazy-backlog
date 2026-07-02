@@ -37,6 +37,15 @@ describe("autoFillRequired — board Team injection", () => {
     expect(fields[TEAM_FIELD]).toBeUndefined();
   });
 
+  it("does NOT inject the board Team when the subtask flag is missing (unvalidated legacy schema)", () => {
+    const schema = schemaWithTeam();
+    // Simulate a persisted schema loaded via JSON.parse with no normalisation.
+    delete (schema.issueTypes[1] as { subtask?: boolean }).subtask;
+    const fields: Record<string, unknown> = {};
+    autoFillRequired(schema, fields, "Sub-task");
+    expect(fields[TEAM_FIELD]).toBeUndefined();
+  });
+
   it("does not overwrite a Team value that was already set", () => {
     const fields: Record<string, unknown> = { [TEAM_FIELD]: "explicit-team" };
     autoFillRequired(schemaWithTeam(), fields, "Task");
