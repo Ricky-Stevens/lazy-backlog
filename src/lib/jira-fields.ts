@@ -78,7 +78,12 @@ export function autoFillRequired(schema: JiraSchema | null, fields: Record<strin
     if (!field.required || SYSTEM.has(field.system || field.id) || fields[field.id] !== undefined) continue;
     if (field.allowedValues?.length) fields[field.id] = { id: field.allowedValues[0]?.id };
   }
-  if (schema.board?.teamId && schema.board.teamFieldId) {
+  // Sub-tasks inherit their Team from the parent; Jira rejects an explicit Team
+  // on a sub-task ("... is a subtask, and inherits the team assignment from its
+  // parent"). Inject the board Team only when the schema explicitly marks the type
+  // as not a sub-task. Team is optional, so an unvalidated legacy schema missing the
+  // subtask flag safely skips the default rather than risking a sub-task failure.
+  if (ts.subtask === false && schema.board?.teamId && schema.board.teamFieldId) {
     if (fields[schema.board.teamFieldId] === undefined) {
       fields[schema.board.teamFieldId] = schema.board.teamId;
     }
